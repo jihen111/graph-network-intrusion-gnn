@@ -1,0 +1,22 @@
+flowchart TB
+    A["CIC-IDS2017 GeneratedLabelledFlows<br/>Flows + labels + IPs + timestamps"]
+    B["Timestamp parsing + UTC-aligned 1-hour windows"]
+    C["Chronological split<br/>60% train / 20% validation / 20% test"]
+    D["Train-only preprocessing<br/>Impute, log1p, scale, encode"]
+    E["Host graph per hour<br/>Nodes = IP hosts; directed edges = flows"]
+    A --> B --> C --> D --> E
+    subgraph Models["Models and analyses"]
+        direction LR
+        F["Edge-aware GraphSAGE<br/>Flow features in messages + edge classifier"]
+        G["Flow-only Random Forest<br/>Non-graph baseline"]
+        H["Benign-only graph autoencoder<br/>Topology encoder → flow-feature reconstruction"]
+        K["Graph analytics<br/>Degree, fan-out, flagged attack subgraph"]
+    end
+    E --> F
+    D --> G
+    E --> H
+    E --> K
+    F --> I["Test evaluation<br/>Precision, Recall, F1, PR-AUC, FPR, per-attack"]
+    G --> I
+    H --> I
+    I --> J["Label efficiency + ablations<br/>1 / 5 / 10 / 25 / 100% labels; feature variants"]
