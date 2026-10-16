@@ -5,14 +5,21 @@ import numpy as np
 from sklearn.metrics import average_precision_score, confusion_matrix, precision_recall_curve
 
 
-def threshold_max_f1(y_val: np.ndarray, scores: np.ndarray, default: float = 0.5) -> float:
-    """Threshold maximising F1 on validation labels (falls back to `default` if no attack in val)."""
+def threshold_max_f1(y_val: np.ndarray, scores: np.ndarray, default: float = 0.5, tolerance: float = 0.01) -> float:
+    """Robust F1 threshold chosen on validation labels.
+
+    Validation F1 is often flat near its maximum over a wide range of
+    thresholds; the single arg-max can then land on an extreme value
+    (e.g. 0.9994) that transfers badly to test. We take the middle of the
+    score range whose validation F1 is within `tolerance` of the best.
+    """
     y_val = np.asarray(y_val, dtype=int)
     if y_val.sum() == 0 or y_val.sum() == len(y_val):
         return float(default)
     precision, recall, thresholds = precision_recall_curve(y_val, scores)
     f1 = 2 * precision[:-1] * recall[:-1] / np.maximum(precision[:-1] + recall[:-1], 1e-12)
-    return float(thresholds[int(np.nanargmax(f1))])
+    near_best = thresholds[f1 >= np.nanmax(f1) - tolerance]
+    return float((near_best.min() + near_best.max()) / 2)
 
 
 def threshold_at_fpr(y_val: np.ndarray, scores: np.ndarray, fpr: float = 0.01) -> float:

@@ -59,3 +59,9 @@ Per host and window: out-degree, in-degree, distinct destinations, distinct sour
 
 ## 20. Why recall at 1 % false-positive rate?
 In a security operations centre, analysts can only review so many alerts. Fixing the false-positive budget (here 1 % of benign flows, set on validation) and reporting how many attacks are caught is closer to how a detector is actually used than F1 alone.
+
+## 21. Why do attacks in CIC-IDS2017 look like "one source, one destination, many ports"?
+The attacker machines sit outside the victim network and reach it through a firewall doing NAT, so most attack flows appear to come from one address (172.16.0.1). A host graph therefore sees few distinct hosts but a very high number of distinct ports per window. The structural node feature "distinct destination ports" captures exactly that, which is why the structure-only GNN works so well here. On a real network without that NAT, fan-out to many hosts would matter more.
+
+## 22. Why does the GNN miss the botnet on unseen attacks?
+Bot traffic is a few infected hosts making ordinary-looking, low-volume connections to a command-and-control server. Its structure resembles normal client traffic, and no botnet was in the training days. Scans and DDoS have a striking structural signature; a botnet does not. Catching it would need longer time windows (periodic beaconing) or host-level behaviour over hours.

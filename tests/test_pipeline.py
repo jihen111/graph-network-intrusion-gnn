@@ -131,6 +131,12 @@ class GraphTests(unittest.TestCase):
 
 
 class MetricTests(unittest.TestCase):
+    def test_f1_threshold_sits_inside_a_flat_plateau_not_at_its_edge(self):
+        y = np.array([0] * 50 + [1] * 50)
+        s = np.concatenate([np.linspace(0, .2, 50), np.linspace(.8, 1, 50)])  # any threshold in (0.2, 0.8] is perfect
+        t = threshold_max_f1(y, s)
+        self.assertTrue(.2 < t <= .9)
+
     def test_thresholds_use_validation_only(self):
         y = np.array([0, 0, 0, 0, 1, 1])
         s = np.array([.1, .2, .3, .4, .35, .9])

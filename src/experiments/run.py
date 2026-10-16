@@ -107,12 +107,14 @@ def run_protocol(name, frame, splits, cfg, seeds, keep_scores=False):
         f"windows = {len(graphs['train'])}/{len(graphs['val'])}/{len(graphs['test'])}; features = {X.shape[1]}")
     records = {k: [] for k in MODELS}
     kept, timings = {}, {k: [] for k in MODELS}
+    store = {"y_val": y_va.astype(np.int8), "y_test": y_te.astype(np.int8), "attack_test": a_te.astype(str)}
     for seed in seeds:
         t = time.time()
         rf = make_baseline(seed, int(e["rf_trees"]), float(e["rf_max_samples"]))
         rf.fit(X[order["train"]], y_tr)
         s_va, s_te = rf.predict_proba(X[order["val"]])[:, 1], rf.predict_proba(X[order["test"]])[:, 1]
         records[MODELS[0]].append({"seed": seed, **evaluate_scores(y_va, s_va, y_te, s_te, a_te)})
+        store[f"rf_{seed}_val"], store[f"rf_{seed}_test"] = s_va.astype(np.float32), s_te.astype(np.float32)
         timings[MODELS[0]].append(time.time() - t)
         if keep_scores and seed == seeds[0]:
             kept[MODELS[0]] = s_te
@@ -124,6 +126,7 @@ def run_protocol(name, frame, splits, cfg, seeds, keep_scores=False):
                              validation_graphs=graphs["val"], patience=int(m["early_stopping_patience"]))
         s_va, s_te = predict_supervised(gnn, graphs["val"]), predict_supervised(gnn, graphs["test"])
         records[MODELS[1]].append({"seed": seed, "epochs": gnn.epochs_trained, **evaluate_scores(y_va, s_va, y_te, s_te, a_te)})
+        store[f"gnn_{seed}_val"], store[f"gnn_{seed}_test"] = s_va.astype(np.float32), s_te.astype(np.float32)
         timings[MODELS[1]].append(time.time() - t)
         if keep_scores and seed == seeds[0]:
             kept[MODELS[1]] = s_te
@@ -136,6 +139,7 @@ def run_protocol(name, frame, splits, cfg, seeds, keep_scores=False):
                                     validation_graphs=graphs["val"], patience=int(m["early_stopping_patience"]))
         s_va, s_te = reconstruction_scores(ae, graphs["val"]), reconstruction_scores(ae, graphs["test"])
         ev = evaluate_scores(y_va, s_va, y_te, s_te, a_te)
+        store[f"ae_{seed}_val"], store[f"ae_{seed}_test"] = s_va.astype(np.float32), s_te.astype(np.float32)
         ev.pop("fixed_0.5")  # reconstruction errors are not probabilities
         records[MODELS[2]].append({"seed": seed, "epochs": ae.epochs_trained, **ev})
         timings[MODELS[2]].append(time.time() - t)
@@ -150,10 +154,13 @@ def run_protocol(name, frame, splits, cfg, seeds, keep_scores=False):
         "features": int(X.shape[1]),
         "per_seed": records,
         "summary": {k: {p: summarize(v, p) for p in v[0] if p not in {"seed", "epochs"}} for k, v in records.items()},
-        "detection_rate_per_attack": {k: per_attack_mean(v, "val_f1_threshold") for k, v in records.items()},
+        "detection_rate_per_attack": {k: {p: per_attack_mean(v, p) for p in ("val_f1_threshold", "val_fpr_1pct_threshold")}
+                                      for k, v in records.items()},
         "seconds_per_seed": {k: float(np.mean(v)) for k, v in timings.items()},
         "runtime_seconds": float(time.time() - t0),
     }
+    out = Path(cfg["experiments"].get("output_dir", "results"))
+    np.savez_compressed(out / f"scores_{name.lower().replace(' ', '_')}.npz", **store)  # lets thresholds be re-derived without retraining
     extra = {"graphs": graphs, "order": order, "X": X, "scores": kept, "y_test": y_te} if keep_scores else None
     return result, extra
 
@@ -305,53 +312,77 @@ def fig_graph_comparison(stats, out):
     plt.close(fig)
 
 
-def fig_attack_subgraph(frame, graphs, order, scores, threshold, out):
-    """Pick the test window with the most flagged PortScan (else any attack) flows and draw it."""
-    attack = frame["_attack_type"].to_numpy()[order]
-    best, cursor = None, 0
+def _flagged_windows(graphs, attack, scores, threshold):
+    cursor = 0
     for g in graphs:
         n = len(g.y)
-        s, a = scores[cursor:cursor + n], attack[cursor:cursor + n]
+        yield g, scores[cursor:cursor + n], attack[cursor:cursor + n]
         cursor += n
-        flagged = s >= threshold
-        for kind_rank, kind in enumerate(("PortScan", "DDoS", "DoS Hulk", "Bot")):
-            hits = int(((a == kind) & flagged).sum())
-            if hits:
-                key = (-kind_rank, hits)
-                if best is None or key > best[0]:
-                    best = (key, g, s, a, kind)
-                break
-    fig, ax = plt.subplots(figsize=(9, 6.5))
-    if best is None:
-        ax.text(0.5, 0.5, "No test window contains a flagged attack flow.", ha="center")
-        ax.set_axis_off()
-        info = {}
-    else:
-        _, g, s, a, kind = best
+
+
+def fig_attack_subgraph(frame, graphs, order, scores, threshold, out):
+    """Two flagged test subgraphs: the attack involving the most hosts, and a port scan."""
+    attack = frame["_attack_type"].to_numpy()[order]
+    multi, scan = None, None
+    for g, s, a in _flagged_windows(graphs, attack, scores, threshold):
+        hit = np.flatnonzero((s >= threshold) & (a != "Benign"))
+        if not len(hit):
+            continue
+        hosts = len({g.src_hosts[i] for i in hit} | {g.dst_hosts[i] for i in hit})
+        if multi is None or hosts > multi[0]:
+            multi = (hosts, g, s, a)
+        scan_hits = hit[a[hit] == "PortScan"]
+        if len(scan_hits) and (scan is None or len(set(g.dst_port[scan_hits])) > scan[0]):
+            scan = (len(set(g.dst_port[scan_hits])), g, s, a)
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6.2))
+    info = {}
+    ax = axes[0]
+    if multi:
+        _, g, s, a = multi
         flagged = np.flatnonzero(s >= threshold)
         G = nx.DiGraph()
         for i in flagged:
-            u, v = g.src_hosts[i], g.dst_hosts[i]
-            G.add_edge(u, v, w=G.get_edge_data(u, v, {"w": 0})["w"] + 1)
-        true_attack_edges = {(g.src_hosts[i], g.dst_hosts[i]) for i in flagged if a[i] != "Benign"}
-        hubs = sorted(G.degree, key=lambda x: x[1], reverse=True)
-        keep = {n for n, _ in hubs[:80]}
-        H = G.subgraph(keep).copy()
-        pos = nx.spring_layout(H, seed=7, k=1.2 / np.sqrt(max(len(H), 1)))
-        hub = hubs[0][0]
-        colors = [C_ATTACK if n == hub else "#8a93a1" for n in H]
-        sizes = [80 + 18 * H.degree(n) if n == hub else 60 for n in H]
-        edge_colors = [C_ATTACK if (u, v) in true_attack_edges else C_BENIGN for u, v in H.edges]
-        nx.draw_networkx_edges(H, pos, ax=ax, edge_color=edge_colors, width=0.8, arrows=False, alpha=0.7)
-        nx.draw_networkx_nodes(H, pos, ax=ax, node_color=colors, node_size=sizes, edgecolors="white", linewidths=1)
-        nx.draw_networkx_labels(H, pos, labels={hub: hub}, font_size=9, ax=ax)
-        n_flows = len(flagged)
+            G.add_edge(g.src_hosts[i], g.dst_hosts[i], bad=G.get_edge_data(g.src_hosts[i], g.dst_hosts[i], {"bad": False})["bad"] or a[i] != "Benign")
+        if len(G) > 60:
+            G = G.subgraph([n for n, _ in sorted(G.degree, key=lambda x: -x[1])[:60]]).copy()
+        pos = nx.spring_layout(G, seed=7, k=1.5 / np.sqrt(max(len(G), 1)))
+        bad_nodes = {n for u, v, d in G.edges(data=True) if d["bad"] for n in (u, v)}
+        nx.draw_networkx_edges(G, pos, ax=ax, edge_color=[C_ATTACK if d["bad"] else C_BENIGN for _, _, d in G.edges(data=True)],
+                               width=1.4, arrows=True, arrowsize=10, alpha=0.8)
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=[C_ATTACK if n in bad_nodes else "#8a93a1" for n in G],
+                               node_size=[90 + 25 * G.degree(n) for n in G], edgecolors="white", linewidths=1)
+        hub = max(G.degree, key=lambda x: x[1])[0]
+        shown_labels = bad_nodes if len(bad_nodes) <= 15 else {hub}
+        nx.draw_networkx_labels(G, pos, labels={n: n for n in shown_labels}, font_size=8, ax=ax)
+        kind = pd.Series(a[flagged][a[flagged] != "Benign"]).value_counts().index[0]
         n_true = int((a[flagged] != "Benign").sum())
-        ax.set_title(f"Flagged flows in one test window ({kind}): {n_flows:,} flows, {n_true:,} truly malicious,\n"
-                     f"hub {hub} talks to {G.out_degree(hub) + G.in_degree(hub)} hosts (showing {len(H)} hosts)", color=C_TEXT, fontsize=10)
-        ax.set_axis_off()
-        info = {"window": int(g.window_id), "attack_type": kind, "flagged_flows": int(n_flows), "truly_malicious": n_true,
-                "hub": hub, "hub_peers": int(G.out_degree(hub) + G.in_degree(hub)), "hosts_in_flagged_graph": int(G.number_of_nodes())}
+        ax.set_title(f"{kind}: {len(bad_nodes)} hosts involved in one 5-minute test window\n"
+                     f"{len(flagged):,} flagged flows, {n_true:,} truly malicious (red), {len(flagged) - n_true:,} false alarms (blue)",
+                     color=C_TEXT, fontsize=10)
+        info["most_hosts"] = {"window": int(g.window_id), "attack_type": kind, "hosts": len(bad_nodes),
+                              "flagged_flows": int(len(flagged)), "truly_malicious": n_true}
+    ax.set_axis_off()
+    ax = axes[1]
+    if scan:
+        _, g, s, a = scan
+        hit = np.flatnonzero((s >= threshold) & (a == "PortScan"))
+        src, dst = g.src_hosts[hit[0]], g.dst_hosts[hit[0]]
+        ports = np.unique(g.dst_port[hit])
+        shown = np.sort(np.random.default_rng(0).choice(ports, size=min(80, len(ports)), replace=False))
+        G = nx.Graph()
+        G.add_node(src)
+        for p in shown:
+            G.add_edge(src, f":{p}")
+        pos = nx.spring_layout(G, seed=3, k=0.35)
+        nx.draw_networkx_edges(G, pos, ax=ax, edge_color=C_ATTACK, width=0.8, alpha=0.7)
+        nx.draw_networkx_nodes(G, pos, nodelist=[src], node_color=C_ATTACK, node_size=500, ax=ax, edgecolors="white")
+        nx.draw_networkx_nodes(G, pos, nodelist=[n for n in G if n != src], node_color="#8a93a1", node_size=40, ax=ax)
+        nx.draw_networkx_labels(G, pos, labels={src: src}, font_size=9, ax=ax)
+        ax.set_title(f"PortScan: {src} → {dst} on {len(ports):,} distinct ports in 5 minutes\n"
+                     f"({len(hit):,} flagged flows; {len(shown)} ports drawn)", color=C_TEXT, fontsize=10)
+        info["port_scan"] = {"window": int(g.window_id), "source": src, "target": dst, "distinct_ports": int(len(ports)),
+                             "flagged_flows": int(len(hit))}
+    ax.set_axis_off()
     fig.tight_layout()
     fig.savefig(out / "attack_subgraph.png", dpi=150)
     plt.close(fig)

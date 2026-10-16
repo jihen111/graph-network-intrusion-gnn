@@ -42,8 +42,8 @@ def main_table(proto):
     return "\n".join(rows)
 
 
-def attack_table(proto):
-    det = proto["detection_rate_per_attack"]
+def attack_table(proto, point="val_fpr_1pct_threshold"):
+    det = {m: proto["detection_rate_per_attack"][m][point] for m in MODELS}
     names = sorted(det[MODELS[0]], key=lambda n: -det[MODELS[0]][n]["support"])
     rows = ["| Attack type (test flows) | " + " | ".join(SHORT[m] for m in MODELS) + " |",
             "|---|" + "---:|" * len(MODELS)]
@@ -76,12 +76,24 @@ def main():
     best_a, va = best(A)
     best_b, vb = best(B)
     rec_a = {m: A["summary"][m]["val_fpr_1pct_threshold"]["recall"]["mean"] for m in MODELS}
+    fpr_a = {m: A["summary"][m]["val_fpr_1pct_threshold"]["false_positive_rate"]["mean"] for m in MODELS}
+    rec_b = {m: B["summary"][m]["val_fpr_1pct_threshold"]["recall"]["mean"] for m in MODELS}
+    prev_a = A["splits"]["test"]["attacks"] / A["splits"]["test"]["flows"]
+    det_a = A["detection_rate_per_attack"]["E-GraphSAGE"]["val_fpr_1pct_threshold"]
+    det_a_txt = ", ".join(f"{k} {pct(v['mean'])}" for k, v in sorted(det_a.items(), key=lambda kv: -kv[1]["support"]))
     le_s = le.groupby("label_fraction")[["f1", "recall_at_1pct_fpr"]].agg(["mean", "std"])
     ab_s = ab.groupby("variant")[["f1", "pr_auc", "recall_at_1pct_fpr"]].agg(["mean", "std"])
     lo, hi = float(le_s.index.min()), float(le_s.index.max())
     mid = 0.1 if 0.1 in le_s.index else lo
     sub = ga.get("attack_subgraph", {})
     src = ga["per_source_summary"]
+    nat_txt = (f", but only {src['Attack']['destinations_mean']:.1f} destination host on average: in CIC-IDS2017 external attacks reach the "
+               "victims through one NAT gateway (172.16.0.1), so attacks show up as many ports between few hosts."
+               if src["Attack"]["destinations_mean"] < 2 else f", and {src['Attack']['destinations_mean']:.1f} distinct destination hosts.")
+    ae_fpr = A["summary"]["Graph Autoencoder (benign-only)"]["val_f1_threshold"]["false_positive_rate"]["mean"]
+    ae_txt = (f"* **Caveat on the autoencoder:** its F1 in protocol A ({va['Graph Autoencoder (benign-only)']:.3f}) is inflated by the test day's "
+              f"attack prevalence ({pct(prev_a)} of Friday's flows are attacks) and comes with a {pct(ae_fpr)} false-positive rate. "
+              "Recall at a usable false-positive budget is the fairer comparison.\n" if prev_a > 0.3 and ae_fpr > 0.05 else "")
     minutes = metrics["runtime_seconds"] / 60
     seeds = ", ".join(map(str, metrics["seeds"]))
 
@@ -112,11 +124,11 @@ It also measures how much labelled data the GNN needs, which inputs matter (abla
 
 All numbers below are produced by `python -m src.train` and stored in `results/`. Mean ± standard deviation over seeds {seeds}. Each model's alert threshold is chosen on the validation split, then applied once to the test split.
 
-* **Protocol B (attack types seen in training):** best F1 is **{vb[best_b]:.3f}** ({best_b}); {finding_b} (F1 {vb['E-GraphSAGE']:.3f} vs {vb['Random Forest (flow-only)']:.3f}).
-* **Protocol A (attack types never seen in training):** best F1 is **{va[best_a]:.3f}** ({best_a}). At a 1 % false-positive budget, recall is {rec_a['Random Forest (flow-only)']:.3f} for the Random Forest, {rec_a['E-GraphSAGE']:.3f} for E-GraphSAGE and {rec_a['Graph Autoencoder (benign-only)']:.3f} for the benign-only autoencoder.
-* **Label efficiency (protocol B):** with {100 * lo:g} % of the training labels E-GraphSAGE reaches F1 {le_s.loc[lo, ('f1', 'mean')]:.3f}, against {le_s.loc[hi, ('f1', 'mean')]:.3f} with {100 * hi:g} %.
-* **Graph structure:** in protocol B test windows, an attacking source contacts on average {src['Attack']['ports_mean']:.1f} distinct destination ports per window, against {src['Benign']['ports_mean']:.1f} for a benign source.
-
+* **Unseen attacks (protocol A, test = Friday's Bot, PortScan and DDoS):** with the alert threshold set for 1 % false positives on validation, E-GraphSAGE catches **{pct(rec_a['E-GraphSAGE'])}** of the attack flows ({det_a_txt}; test false-positive rate {pct(fpr_a['E-GraphSAGE'])}), against {pct(rec_a['Random Forest (flow-only)'])} for the flow-only Random Forest ({pct(fpr_a['Random Forest (flow-only)'])}) and {pct(rec_a['Graph Autoencoder (benign-only)'])} for the benign-only autoencoder ({pct(fpr_a['Graph Autoencoder (benign-only)'])}).
+* **Seen attacks (protocol B):** F1 is {vb['Random Forest (flow-only)']:.3f} for the Random Forest, {vb['E-GraphSAGE']:.3f} for E-GraphSAGE and {vb['Graph Autoencoder (benign-only)']:.3f} for the autoencoder (validation-tuned threshold). At 1 % false positives, recall is {pct(rec_b['Random Forest (flow-only)'])} and {pct(rec_b['E-GraphSAGE'])} respectively.
+* **Few labels are enough on seen attacks:** with {100 * lo:g} % of the training labels E-GraphSAGE reaches F1 {le_s.loc[lo, ('f1', 'mean')]:.3f}, against {le_s.loc[hi, ('f1', 'mean')]:.3f} with {100 * hi:g} %.
+* **Structure carries the signal:** a GNN that sees only graph structure (degrees, distinct peers and ports, no flow statistics) reaches PR-AUC {ab_s.loc['graph structure only', ('pr_auc', 'mean')]:.3f} on protocol B. In test windows an attacking source contacts on average {src['Attack']['ports_mean']:.1f} distinct destination ports, against {src['Benign']['ports_mean']:.1f} for a benign source{nat_txt}
+{ae_txt}
 ![Model comparison](results/model_comparison.png)
 
 ## Data and evaluation protocols
@@ -144,7 +156,7 @@ Attack times after the 12-hour clock repair:
 
 {main_table(A)}
 
-Share of each attack type's test flows flagged (validation-tuned threshold):
+Share of each attack type's test flows flagged, with the threshold set for 1 % validation false positives:
 
 {attack_table(A)}
 
@@ -179,10 +191,10 @@ Share of each attack type's test flows flagged (validation-tuned threshold):
 
 ![Graph comparison](results/graph_comparison.png)
 
-""" + (f"""The figure below shows the flows E-GraphSAGE flags in one protocol B test window containing **{sub['attack_type']}**: {sub['flagged_flows']:,} flagged flows, {sub['truly_malicious']:,} of them truly malicious. The hub `{sub['hub']}` is connected to {sub['hub_peers']} hosts in that window.
+""" + (f"""The figure below shows flows flagged by E-GraphSAGE in two protocol B test windows. Left: **{sub['most_hosts']['attack_type']}**, the attack involving the most hosts ({sub['most_hosts']['hosts']} hosts; {sub['most_hosts']['truly_malicious']:,} of {sub['most_hosts']['flagged_flows']:,} flagged flows truly malicious). Right: a port scan from `{sub['port_scan']['source']}` to `{sub['port_scan']['target']}` on {sub['port_scan']['distinct_ports']:,} distinct ports within 5 minutes.
 
-![Attack subgraph](results/attack_subgraph.png)
-""" if sub else "") + f"""
+![Attack subgraphs](results/attack_subgraph.png)
+""" if sub.get("most_hosts") and sub.get("port_scan") else "") + f"""
 ## From flows to provenance graphs and lateral movement
 
 This project works on network flows. Moving to system-log provenance graphs (processes, files, sockets as typed nodes; read/write/fork/connect as typed edges) calls for heterogeneous or temporal GNNs (R-GCN, TGN) instead of the homogeneous GraphSAGE used here. Lateral movement is a path across several hosts and windows, so per-edge detections must be joined: link anomalous edges that share a host and follow each other in time, then score the chain. Evaluating that needs path-level labels (for example LANL or DARPA OpTC) and splits by time and by host. Notebook 02 develops this.
@@ -227,8 +239,6 @@ Or run everything at once: `python run_all.py` (also used by `RUN_ON_COLAB.ipynb
 """
     Path("README.md").write_text(readme, encoding="utf-8")
 
-    rf_b, gnn_b = B["summary"][MODELS[0]]["val_f1_threshold"], B["summary"][MODELS[1]]["val_f1_threshold"]
-    ae_a = A["summary"][MODELS[2]]["val_f1_threshold"]
     summary = f"""# Run summary (version 2)
 
 **Run:** {minutes:.0f} minutes, seeds {seeds}, {d['flows_used']:,} flows used of {d['flows_total']:,} (all {d['attack_flows_total']:,} attack flows), 5-minute graph windows.
@@ -256,8 +266,8 @@ Time per seed (seconds): """ + ", ".join(f"{SHORT[m]} {B['seconds_per_seed'][m]:
 
 ## Lignes CV (français, chiffres réels)
 
-1. **Détection d'intrusions réseau par GNN** – pipeline PyTorch Geometric sur CIC-IDS2017 ({fr(d['flows_used'] / 1e6, 1)} M de flux, graphes d'hôtes par fenêtre de 5 min) : E-GraphSAGE, autoencodeur de graphes non supervisé et Random Forest de référence, sur attaques connues et inconnues.
-2. E-GraphSAGE : F1 {fr(gnn_b['f1']['mean'])} sur attaques connues (Random Forest {fr(rf_b['f1']['mean'])}), F1 {fr(le_s.loc[lo, ('f1', 'mean')])} avec seulement {100 * lo:g} % des labels ; autoencodeur F1 {fr(ae_a['f1']['mean'])} sur attaques jamais vues ; extraction de sous-graphes d'attaque (NetworkX).
+1. **Détection d'intrusions réseau par GNN** – pipeline PyTorch Geometric sur CIC-IDS2017 ({fr(d['flows_used'] / 1e6, 1)} M de flux, un graphe d'hôtes par fenêtre de 5 min, attributs structurels) : E-GraphSAGE, autoencodeur de graphes non supervisé et Random Forest de référence.
+2. Sur des attaques jamais vues à l'entraînement, E-GraphSAGE détecte {fr(100 * rec_a['E-GraphSAGE'], 0)} % des flux malveillants (seuil réglé pour 1 % de faux positifs en validation ; {fr(100 * fpr_a['E-GraphSAGE'], 1)} % en test) contre {fr(100 * rec_a['Random Forest (flow-only)'], 0)} % pour le Random Forest ; F1 {fr(le_s.loc[lo, ('f1', 'mean')])} avec seulement {100 * lo:g} % des labels ; extraction de sous-graphes d'attaque (NetworkX).
 """
     Path("SUMMARY.md").write_text(summary, encoding="utf-8")
     print("Wrote README.md and SUMMARY.md from results/")

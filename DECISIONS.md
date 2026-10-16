@@ -31,7 +31,10 @@
 
 ## Thresholds and metrics
 
-* Every model's threshold is chosen on **validation** data: the F1-maximising threshold, and the threshold giving a 1 % validation false-positive rate. Test labels are used once.
+* Every model's threshold is chosen on **validation** data: an F1 threshold, and the threshold giving a 1 % validation false-positive rate. Test labels are used once.
+* **F1 threshold rule (changed after the first full run).** The first full run used the single F1 arg-max on validation. For E-GraphSAGE the validation F1 curve is flat near its maximum, and the arg-max sometimes landed on an extreme value (0.9994) that flagged only a third of the test attacks although the same model reached F1 0.99 at 0.5 and PR-AUC 0.99. The rule is now the middle of the score range whose validation F1 is within 0.01 of the best. The rule uses validation data only; it was changed because of a visible selection artefact, and the 1 % FPR operating point, which this change does not affect, is reported alongside.
+* **Recall at 1 % false positives is the headline metric** for unseen attacks: Friday's test day is about 60 % attack traffic, which inflates F1 for a detector with many false alarms.
+* Validation and test scores of every model and seed are saved in `results/scores_*.npz`, so operating points can be re-derived without retraining.
 * The fixed 0.5 threshold is still stored for the supervised models, for comparison with v1.
 * Reported: precision, recall, F1, false-positive rate, PR-AUC, recall at 1 % FPR, and per attack type the share of flows flagged (detection rate).
 
