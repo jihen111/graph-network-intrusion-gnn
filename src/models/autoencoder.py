@@ -8,31 +8,40 @@ import torch
 from torch import nn
 from torch_geometric.nn import SAGEConv
 
-from src.build_graph import FlowGraph
+from src.build_graph import DEVICE, FlowGraph, N_STRUCT
 from src.models.gnn import set_seed
 
 
 class EdgeFeatureAutoencoder(nn.Module):
-    """Reconstruct edge attributes from endpoint topology embeddings only."""
-    def __init__(self, edge_dim: int, hidden: int = 32):
+    """Reconstruct a flow's attributes from its endpoints' structural embeddings only."""
+    def __init__(self, edge_dim: int, hidden: int = 64):
         super().__init__()
-        self.conv1 = SAGEConv(2, hidden)
+        self.conv1 = SAGEConv(N_STRUCT, hidden)
         self.conv2 = SAGEConv(hidden, hidden)
         self.decoder = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.ReLU(), nn.Linear(hidden, edge_dim))
 
     def forward(self, graph: FlowGraph) -> torch.Tensor:
         # Never feed the target edge features (or node aggregates of them) to
         # the reconstruction network: that would permit a direct copy shortcut.
-        n = graph.node_x.shape[0]
         edge_count = len(graph.y)
         src = graph.edge_index[0, :edge_count]
         dst = graph.edge_index[1, :edge_count]
-        out_degree = torch.bincount(src, minlength=n).to(dtype=graph.node_x.dtype)
-        in_degree = torch.bincount(dst, minlength=n).to(dtype=graph.node_x.dtype)
-        x = torch.stack([torch.log1p(in_degree), torch.log1p(out_degree)], dim=1)
+        x = graph.struct_x  # degrees, distinct peers and ports: topology only
         h = torch.relu(self.conv1(x, graph.edge_index))
         h = torch.relu(self.conv2(h, graph.edge_index))
         return self.decoder(torch.cat([h[src], h[dst]], dim=1))
+
+
+def _benign_structure(graph: FlowGraph, benign_idx: torch.Tensor) -> torch.Tensor:
+    """Recompute structural node features from benign flows only (no attack leakage)."""
+    from src.build_graph import structural_features
+    idx = benign_idx.numpy()
+    n = graph.struct_x.shape[0]
+    src = graph.edge_index[0, benign_idx].numpy()
+    dst = graph.edge_index[1, benign_idx].numpy()
+    dport = graph.dst_port[idx] if graph.dst_port is not None else np.zeros(len(idx), dtype=np.int64)
+    sport = graph.src_port[idx] if graph.src_port is not None else np.zeros(len(idx), dtype=np.int64)
+    return torch.as_tensor(structural_features(src, dst, dport, sport, n))
 
 
 def _benign_only_graph(graph: FlowGraph) -> FlowGraph | None:
@@ -48,16 +57,19 @@ def _benign_only_graph(graph: FlowGraph) -> FlowGraph | None:
         y=graph.y[benign_idx],
         src_hosts=[graph.src_hosts[i] for i in benign_idx.tolist()],
         dst_hosts=[graph.dst_hosts[i] for i in benign_idx.tolist()],
+        struct_x=_benign_structure(graph, benign_idx),
         node_x=torch.zeros_like(graph.node_x),
         row_indices=graph.row_indices[benign_idx.cpu().numpy()],
         window_id=graph.window_id,
+        dst_port=graph.dst_port[benign_idx.numpy()] if graph.dst_port is not None else None,
+        src_port=graph.src_port[benign_idx.numpy()] if graph.src_port is not None else None,
     )
 
 
 def fit_benign_autoencoder(
-    train_graphs: Iterable[FlowGraph], input_dim: int, edge_dim: int, seed: int,
-    epochs: int = 8, learning_rate: float = 0.003, weight_decay: float = 1e-4, hidden: int = 32,
-    validation_graphs: Iterable[FlowGraph] | None = None, patience: int = 2, min_delta: float = 1e-5,
+    train_graphs: Iterable[FlowGraph], edge_dim: int, seed: int,
+    epochs: int = 20, learning_rate: float = 0.003, weight_decay: float = 1e-4, hidden: int = 64,
+    validation_graphs: Iterable[FlowGraph] | None = None, patience: int = 3, min_delta: float = 1e-5,
 ) -> EdgeFeatureAutoencoder:
     """Fit benign-only subgraphs and stop on validation-benign reconstruction loss."""
     set_seed(seed)
@@ -67,12 +79,14 @@ def fit_benign_autoencoder(
     val_graphs = [subgraph for graph in validation_graphs or [] if (subgraph := _benign_only_graph(graph)) is not None]
     if val_graphs and patience < 1:
         raise ValueError("Early-stopping patience must be at least one.")
-    model = EdgeFeatureAutoencoder(edge_dim, hidden)
+    model = EdgeFeatureAutoencoder(edge_dim, hidden).to(DEVICE)
+    rng = np.random.default_rng(seed)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     best_loss, best_state, stale_epochs, trained_epochs = float("inf"), None, 0, 0
     for epoch in range(epochs):
         model.train()
-        for graph in graphs:
+        for k in rng.permutation(len(graphs)):
+            graph = graphs[k].to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
             reconstruction = model(graph)
             loss = nn.functional.mse_loss(reconstruction, graph.edge_x)
@@ -84,6 +98,7 @@ def fit_benign_autoencoder(
             total_loss, element_count = 0.0, 0
             with torch.no_grad():
                 for graph in val_graphs:
+                    graph = graph.to(DEVICE)
                     reconstruction = model(graph)
                     total_loss += nn.functional.mse_loss(reconstruction, graph.edge_x, reduction="sum").item()
                     element_count += graph.edge_x.numel()
@@ -108,6 +123,7 @@ def reconstruction_scores(model: EdgeFeatureAutoencoder, graphs: Iterable[FlowGr
     outputs = []
     with torch.no_grad():
         for graph in graphs:
+            graph = graph.to(DEVICE)
             err = (model(graph) - graph.edge_x).pow(2).mean(dim=1)
             outputs.append(err.cpu().numpy())
     return np.concatenate(outputs) if outputs else np.array([], dtype=float)

@@ -1,30 +1,49 @@
-# Design decisions
+# Design decisions (version 2)
 
-## Dataset selection
+## Dataset
 
-- I first downloaded the public [NF-UNSW-NB15-v2 mirror](https://www.kaggle.com/datasets/dhoogla/nfunswnb15v2). Its 1,986,745 rows have 43 fields, including `Label` and `Attack`, but the distributed table contains no source/destination host identifiers and no event timestamp. A host-flow graph or honest chronological split cannot be built from those columns. I did not invent endpoints or times.
-- I also inspected the CIC-IDS2017 MachineLearningCSV mirror; it is a feature-only table and likewise omits endpoint identifiers and timestamps.
-- I therefore selected the CIC-IDS2017 **GeneratedLabelledFlows** archive, which preserves flow IDs, source/destination IPs and ports, timestamps, flow features, and labels. The [official CIC portal](https://www.unb.ca/cic/datasets/ids-2017.html) documents the labelled flows; this repository downloads the public [Hugging Face mirror](https://huggingface.co/datasets/bencorn/CICIDS2017). Only labelled flow CSVs are used; packet captures are not downloaded.
-- This is an explicit scope adjustment: the experiment uses CIC-IDS2017 labelled flows rather than claiming the NF-UNSW-NB15-v2 feature-only parquet contains graph endpoints.
-- The public CSV mirror includes a small set of rows with both empty timestamps and empty labels. The loader excludes these as unlabelled records before class-stratified sampling; they are never miscounted as attacks.
+* **CIC-IDS2017 `GeneratedLabelledFlows`.** It keeps source/destination IPs, ports and timestamps, which are needed to build host graphs and time windows. NF-UNSW-NB15-v2 and the CIC `MachineLearningCSV` files were rejected in v1 because they lack endpoints and timestamps.
+* **Labels:** rows with an empty label are dropped, never counted as attacks. Attack names are normalised (the CSVs use a non-ASCII dash in `Web Attack – …`).
 
-## Graph definition
+## Timestamps
 
-- Nodes are IP hosts; each original flow is a directed edge from source to destination. Message passing uses the reverse arc as well, but each flow label is scored once.
-- Host-level nodes preserve communication fan-out across ports. IP:port endpoints would capture service/client roles more precisely but fragment hosts into many sparse nodes. Ports are retained as coarse well-known/registered/ephemeral edge-feature categories, never as raw numeric model inputs.
-- Flow features are edge attributes and are included in both directions of each EdgeSAGE message. Node attributes are the mean of incident edge features in the current one-hour window. The no-edge-feature ablation uses degree-based node features and zeros the edge vector.
-- The benign-only autoencoder intentionally uses only endpoint in/out-degree to produce node embeddings, then reconstructs the flow attributes. It never receives the target edge's feature vector as input, preventing an easy self-copy shortcut.
+* The CSVs write dates as day/month/year. Several files write afternoon times on a 12-hour clock without AM/PM (`7/7/2017 3:56` is 15:56). Captures only cover working hours (about 08:55–17:00), so any hour before 08:00 is shifted by 12 hours.
+* The repair is checked, not assumed: `results/metrics.json` stores the first and last time of every attack type after repair, and notebook 01 compares them with the schedule published by the dataset authors.
+* Times are local lab time; no timezone conversion is applied (none is needed for windows or splits).
 
-## Time and splits
+## Graph construction
 
-- The CIC `Timestamp` field uses day/month/year and is parsed by assigning UTC to the naive source time (the archive supplies no timezone offset). One graph covers one UTC-aligned hour; whole hourly windows are assigned chronologically to 60/20/20 train/validation/test partitions, so no graph crosses a split boundary.
-- If a future dataset has no usable timestamp, the loader warns and uses source-row order only as a proxy. Such a proxy must not be described as wall-clock temporal evaluation.
-- All imputers, encoders and scalers are fitted on training flows only. The validation period selects the benign autoencoder threshold; the test period is used only for final metrics.
+* **One graph per 5-minute window.** Short enough for attack structure to stand out, long enough to contain many flows. Windows never cross a split.
+* **Nodes are hosts (IPs), edges are flows.** Endpoint nodes (IP:port) would split each host into many low-degree nodes and hide fan-out; ports are kept as coarse buckets in the flow features and as distinct-port counts in the node features.
+* **Node features = 6 structural features + mean incident flow features.** Structural features: log out-degree, in-degree, distinct destinations, distinct sources, distinct destination ports contacted, distinct source ports seen. They are computed from the window's topology and expose scanning (many ports) and DDoS (many sources to one target).
+* **Message passing uses both directions** of every flow; each flow is classified once from [source embedding ‖ destination embedding ‖ flow features].
 
-## Compute and reproducibility
+## Data reduction (topology-preserving)
 
-- The default is a stratified 40,000-flow sample so three-seed comparisons and label/feature ablations finish on CPU. `--sample 0` requests all available labelled flows; larger values can be supplied with `--sample N`.
-- Both graph models use a maximum of eight epochs and patience-two early stopping on validation loss (benign validation reconstruction loss for the autoencoder); the best validation checkpoint is restored. The test split is not used for stopping.
-- Sampling is deterministic with seed 17 and preserves the overall benign/attack proportions. Model seeds are fixed separately at 11, 23 and 37.
-- Label-efficiency masks are drawn once over all training edges, stratified by binary class, then held fixed across epochs. Class weights are calculated from the selected labels only.
-- The original dataset files remain under the Git-ignored `data/raw/` directory and are not committed or included in the source archive.
+* v1 sampled 40,000 flows at random over five days, which left about 600 flows per hourly graph and destroyed scan and DDoS patterns.
+* v2 keeps **every attack flow and every window**, and keeps at most `benign_cap_per_window` benign flows per window (random). Attack structure is complete; benign graphs are thinner than reality, which is stated as a limitation.
+
+## Evaluation protocols
+
+* **Protocol A, unseen attacks:** train Monday–Wednesday, validate Thursday, test Friday. Friday's Bot, PortScan and DDoS never appear in training. Supervised models are expected to struggle; this is the zero-day setting where the benign-only autoencoder should help.
+* **Protocol B, seen attacks:** each window is labelled by its dominant attack type; the windows of each type are split chronologically 60/20/20, so every type appears in train, validation and test. Types with fewer than 3 windows stay in train. Neighbouring windows of one attack episode are correlated, so B is the optimistic setting.
+* Label efficiency and the ablation run on protocol B, where supervised learning is meaningful.
+
+## Thresholds and metrics
+
+* Every model's threshold is chosen on **validation** data: the F1-maximising threshold, and the threshold giving a 1 % validation false-positive rate. Test labels are used once.
+* The fixed 0.5 threshold is still stored for the supervised models, for comparison with v1.
+* Reported: precision, recall, F1, false-positive rate, PR-AUC, recall at 1 % FPR, and per attack type the share of flows flagged (detection rate).
+
+## Models
+
+* **Random Forest (flow-only):** 100 trees, balanced class weights, each tree on 30 % of the training flows (speed on CPU).
+* **E-GraphSAGE:** two edge-aware GraphSAGE layers (mean aggregation, flow features inside each message), hidden size 64, class-weighted cross-entropy, up to 20 epochs with early stopping on validation loss (patience 3), best checkpoint restored. Window order is shuffled every epoch.
+* **Graph autoencoder (benign-only):** trained on benign edges only; endpoint embeddings come from the structural node features (recomputed without attack edges), and the decoder reconstructs the flow's features. The target flow's own features are never an input, so it cannot copy them. Anomaly score = reconstruction error.
+* Seeds 11, 23 and 37 for every model; mean ± standard deviation reported.
+
+## Compute
+
+* Everything runs on CPU; a GPU is used automatically when available (`RUN_ON_COLAB.ipynb`).
+* `python -m src.train --quick` runs one seed with a small benign cap, for smoke tests only.
+* `scripts/make_smoke_data.py` writes a tiny synthetic CIC-like dataset used only to test that the pipeline runs; no metric from it is ever reported.

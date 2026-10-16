@@ -1,15 +1,30 @@
-"""Dataset loading, label normalization, stratified sampling and ordered splits."""
+"""Load CIC-IDS2017 labelled flows, repair timestamps, sample by window and split.
+
+Two evaluation protocols are provided:
+
+* Protocol A ("unseen attacks"): train on Monday-Wednesday, validate on
+  Thursday, test on Friday. Friday's attacks (Bot, PortScan, DDoS) never appear
+  in training, so this measures generalisation to new attack types.
+* Protocol B ("seen attacks"): every time window is labelled by its dominant
+  attack type, and the windows of each type are split chronologically
+  60/20/20. Every attack type with enough windows appears in train, validation
+  and test, while whole windows never cross a split boundary.
+"""
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import warnings
 
 import numpy as np
 import pandas as pd
 
+DAY_NAMES = {0: "Monday", 1: "Tuesday", 2: "Wednesday", 3: "Thursday", 4: "Friday"}
+WORK_START_HOUR = 8  # CIC-IDS2017 captures run from about 08:55 to 17:00 local time
+
 
 def find_column(frame: pd.DataFrame, candidates: tuple[str, ...], required: bool = True) -> str | None:
-    lookup = {str(c).strip().lstrip("\ufeff").lower(): str(c) for c in frame.columns}
+    lookup = {str(c).strip().lstrip("﻿").lower(): str(c) for c in frame.columns}
     for candidate in candidates:
         if candidate.lower() in lookup:
             return lookup[candidate.lower()]
@@ -19,6 +34,7 @@ def find_column(frame: pd.DataFrame, candidates: tuple[str, ...], required: bool
 
 
 def _binary_labels(series: pd.Series) -> np.ndarray:
+    """0 = benign, 1 = attack, -1 = missing label (dropped, never counted as attack)."""
     tokens = series.astype("string").str.strip().str.lower()
     empty = tokens.isna() | tokens.isin({"", "nan", "none", "null"})
     benign = tokens.isin({"0", "benign", "normal", "false"})
@@ -30,180 +46,133 @@ def _binary_labels(series: pd.Series) -> np.ndarray:
     return result
 
 
-def _read_csv_directory(path: Path, sample: int | None, seed: int) -> pd.DataFrame:
-    files = sorted(path.rglob("*.csv"))
-    if not files:
-        raise FileNotFoundError(f"No CSV files found in {path}")
-    if not sample or sample <= 0:
-        return pd.concat([pd.read_csv(f, low_memory=False, encoding="cp1252") for f in files], ignore_index=True, sort=False)
-
-    # First pass reads labels only; the second keeps a uniform, class-stratified reservoir.
-    label_counts = np.zeros(2, dtype=np.int64)
-    label_by_file: dict[Path, str] = {}
-    for file in files:
-        header = pd.read_csv(file, nrows=0, encoding="cp1252")
-        label_col = find_column(header, ("Label", "binary_label", "class", "target"))
-        label_by_file[file] = label_col
-        for chunk in pd.read_csv(file, usecols=[label_col], chunksize=200_000, low_memory=False, encoding="cp1252"):
-            y = _binary_labels(chunk[label_col])
-            label_counts += np.bincount(y[y >= 0], minlength=2)
-    total = int(label_counts.sum())
-    take = min(int(sample), total)
-    raw_quota = take * label_counts / max(total, 1)
-    quotas = np.floor(raw_quota).astype(int)
-    for cls in np.argsort(-(raw_quota - quotas))[: take - int(quotas.sum())]:
-        quotas[cls] += 1
-
-    rng = np.random.default_rng(seed)
-    reservoirs: dict[int, pd.DataFrame] = {0: pd.DataFrame(), 1: pd.DataFrame()}
-    source_offset = 0
-    for file in files:
-        for chunk in pd.read_csv(file, chunksize=100_000, low_memory=False, encoding="cp1252"):
-            label_col = label_by_file[file]
-            y_all = _binary_labels(chunk[label_col])
-            source_rows = np.arange(source_offset, source_offset + len(chunk), dtype=np.int64)
-            source_offset += len(chunk)
-            valid = y_all >= 0
-            if not valid.all():
-                chunk = chunk.loc[valid].copy()
-                y = y_all[valid]
-                source_rows = source_rows[valid]
-            else:
-                y = y_all
-            chunk["_target"] = y
-            chunk["_source_row"] = source_rows
-            for cls in (0, 1):
-                quota = int(quotas[cls])
-                if quota == 0:
-                    continue
-                part = chunk.loc[y == cls].copy()
-                if part.empty:
-                    continue
-                part["_sampling_key"] = rng.random(len(part))
-                candidates = pd.concat([reservoirs[cls], part], ignore_index=True, sort=False)
-                reservoirs[cls] = candidates.nsmallest(quota, "_sampling_key")
-    sampled = pd.concat([reservoirs[0], reservoirs[1]], ignore_index=True, sort=False)
-    return sampled.drop(columns=["_sampling_key"], errors="ignore")
+def normalize_attack_name(name: str) -> str:
+    """'Web Attack � Brute Force' -> 'Web Attack - Brute Force'; 'BENIGN' -> 'Benign'."""
+    text = re.sub(r"[^\x20-\x7e]+", "-", str(name)).strip()
+    text = re.sub(r"\s*-\s*", " - ", text) if "Web Attack" in text else text
+    return "Benign" if text.lower() in {"benign", "normal", "0"} else text
 
 
-def _read_dataset(path: Path, sample: int | None, seed: int) -> pd.DataFrame:
-    if path.is_dir():
-        return _read_csv_directory(path, sample, seed)
-    if path.suffix.lower() in {".parquet", ".pq"}:
-        return pd.read_parquet(path)
-    if path.suffix.lower() == ".csv":
-        return pd.read_csv(path, low_memory=False, encoding="cp1252")
-    raise ValueError(f"Unsupported dataset format: {path.suffix}")
+def repair_cic_timestamps(raw: pd.Series) -> pd.Series:
+    """Parse CIC timestamps (day/month/year) and fix the 12-hour clock.
 
-
-def load_flows(path: str | Path, sample: int | None = None, seed: int = 17) -> pd.DataFrame:
-    """Load flow files; sample by binary class and restore chronological order."""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Dataset not found: {path}. Run python scripts/download_data.py first.")
-    frame = _read_dataset(path, sample if path.is_dir() else None, seed)
-    frame.columns = [str(c).strip().lstrip("\ufeff") for c in frame.columns]
-    label_col = find_column(frame, ("Label", "binary_label", "class", "target"))
-    target = _binary_labels(frame[label_col])
-    labeled = target >= 0
-    if not labeled.all():
-        warnings.warn(f"Dropping {(~labeled).sum()} rows with missing/empty labels.")
-        frame = frame.loc[labeled].copy()
-        target = target[labeled]
-    labels = frame[label_col].astype(str).str.strip()
-    benign_tokens = {"0", "benign", "normal", "false"}
-    frame["_target"] = target
-    attack_col = find_column(frame, ("Attack", "attack_cat", "attack_type"), required=False)
-    attacks = frame[attack_col].fillna("Unknown").astype(str).str.strip() if attack_col else labels
-    frame["_attack_type"] = attacks.where(~attacks.str.lower().isin(benign_tokens), "Benign")
-
-    if not path.is_dir() and sample is not None and sample > 0 and sample < len(frame):
-        # Stratified uniform sampling on binary labels, followed by temporal sorting.
-        rng = np.random.default_rng(seed)
-        chosen: list[int] = []
-        target_values = frame["_target"].to_numpy()
-        for cls in np.unique(target_values):
-            positions = np.flatnonzero(target_values == cls)
-            quota = int(round(sample * len(positions) / len(frame)))
-            chosen.extend(rng.choice(positions, size=min(quota, len(positions)), replace=False).tolist())
-        selected = set(chosen)
-        if len(chosen) < sample:
-            remaining = np.setdiff1d(np.arange(len(frame)), np.fromiter(selected, dtype=np.int64))
-            chosen.extend(rng.choice(remaining, size=sample - len(chosen), replace=False).tolist())
-        elif len(chosen) > sample:
-            chosen = rng.choice(chosen, size=sample, replace=False).tolist()
-        frame = frame.iloc[chosen].copy()
-
-    ts_col = find_column(frame, ("Timestamp", "ts", "flow_start", "flow_start_time", "FLOW_START_MILLISECONDS", "Stime"), required=False)
-    if ts_col:
-        numeric_ts = pd.to_numeric(frame[ts_col], errors="coerce")
-        if numeric_ts.notna().mean() > 0.9:
-            frame["_order"] = numeric_ts
-            values = numeric_ts.to_numpy(dtype=float)
-            magnitude = float(np.nanmedian(np.abs(values)))
-            unit_divisor = 1_000_000.0 if magnitude > 1e14 else (1_000.0 if magnitude > 1e11 else 1.0)
-            frame["_time_seconds"] = numeric_ts / unit_divisor
-        else:
-            parsed = pd.to_datetime(frame[ts_col].astype(str).str.strip(), errors="coerce", utc=True, dayfirst=True, format="mixed")
-            if parsed.notna().mean() > 0.9:
-                valid_time = parsed.notna()
-                if not valid_time.all():
-                    warnings.warn(f"Dropping {(~valid_time).sum()} rows with invalid {ts_col!r} timestamps.")
-                    frame = frame.loc[valid_time].copy()
-                    parsed = parsed.loc[valid_time]
-                parsed_ns = parsed.astype("datetime64[ns, UTC]")
-                time_ns = parsed_ns.astype("int64")
-                frame["_order"] = time_ns
-                frame["_time_seconds"] = time_ns // 1_000_000_000
-            else:
-                warnings.warn(f"Could not reliably parse {ts_col!r}; using source row order.")
-                frame["_order"] = frame["_source_row"] if "_source_row" in frame else np.arange(len(frame))
-                frame["_time_seconds"] = frame["_order"].astype(float)
-                frame["_time_source"] = "source_row_order"
-        if "_time_source" not in frame:
-            frame["_time_source"] = ts_col
-    else:
-        warnings.warn("No timestamp found: ordered windows use source row order, not wall-clock time.")
-        frame["_order"] = frame["_source_row"] if "_source_row" in frame else np.arange(len(frame))
-        frame["_time_seconds"] = frame["_order"].astype(float)
-        frame["_time_source"] = "source_row_order"
-    return frame.sort_values("_order", kind="stable").reset_index(drop=True)
-
-
-def temporal_indices(n_rows: int, train_fraction: float = 0.6, validation_fraction: float = 0.2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return contiguous train/validation/test indices in chronological order."""
-    if not 0 < train_fraction < 1 or not 0 < validation_fraction < 1 or train_fraction + validation_fraction >= 1:
-        raise ValueError("Train and validation fractions must be positive and sum to less than one.")
-    train_end = int(n_rows * train_fraction)
-    val_end = int(n_rows * (train_fraction + validation_fraction))
-    if train_end == 0 or val_end == train_end or val_end >= n_rows:
-        raise ValueError("Not enough rows for a temporal split.")
-    return np.arange(0, train_end), np.arange(train_end, val_end), np.arange(val_end, n_rows)
-
-
-def temporal_window_indices(frame: pd.DataFrame, window_seconds: int = 3600, train_fraction: float = 0.6, validation_fraction: float = 0.2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Split whole timestamp windows chronologically so no graph crosses a split.
-
-    If a real timestamp is unavailable, fall back to contiguous row splits; the
-    data loader marks that case explicitly as a source-order proxy.
+    Several CIC-IDS2017 CSVs write afternoon times on a 12-hour clock without
+    an AM/PM marker (e.g. '7/7/2017 3:56' for 15:56). Captures only cover
+    working hours, so any hour before 08:00 is shifted by 12 hours. The fix is
+    checked against the documented attack schedule in notebook 01.
     """
-    source = str(frame["_time_source"].iloc[0]) if "_time_source" in frame and len(frame) else "source_row_order"
-    if source == "source_row_order" or "_time_seconds" not in frame:
-        return temporal_indices(len(frame), train_fraction, validation_fraction)
-    if window_seconds <= 0:
-        raise ValueError("window_seconds must be positive")
-    seconds = frame["_time_seconds"].to_numpy()
-    if np.issubdtype(seconds.dtype, np.integer):
-        buckets = np.floor_divide(seconds, window_seconds).astype(np.int64)
-    else:
-        buckets = np.floor(seconds.astype(float) / window_seconds).astype(np.int64)
-    unique = np.unique(buckets)
-    if len(unique) < 3:
-        raise ValueError("At least three timestamp windows are required for a temporal split.")
-    train_end = max(1, min(len(unique) - 2, int(len(unique) * train_fraction)))
-    val_end = max(train_end + 1, min(len(unique) - 1, int(len(unique) * (train_fraction + validation_fraction))))
-    train_buckets, val_buckets, test_buckets = unique[:train_end], unique[train_end:val_end], unique[val_end:]
-    train = np.flatnonzero(np.isin(buckets, train_buckets))
-    val = np.flatnonzero(np.isin(buckets, val_buckets))
-    test = np.flatnonzero(np.isin(buckets, test_buckets))
+    text = raw.astype(str).str.strip()
+    parsed = pd.to_datetime(text, format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    missing = parsed.isna()
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(text[missing], format="%d/%m/%Y %H:%M", errors="coerce")
+    missing = parsed.isna()
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(text[missing], dayfirst=True, errors="coerce", format="mixed")
+    early = parsed.dt.hour < WORK_START_HOUR
+    parsed = parsed.where(~early, parsed + pd.Timedelta(hours=12))
+    return parsed
+
+
+def load_cic(path: str | Path) -> pd.DataFrame:
+    """Read every labelled-flow CSV under `path` into one frame (float32 features)."""
+    path = Path(path)
+    files = sorted(path.rglob("*.csv")) if path.is_dir() else [path]
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in {path}. Run python scripts/download_data.py first.")
+    parts = []
+    for file in files:
+        df = pd.read_csv(file, low_memory=False, encoding="cp1252")
+        df.columns = [str(c).strip().lstrip("﻿") for c in df.columns]
+        df = df.loc[:, ~pd.Index(df.columns).duplicated()]
+        for col in df.columns:
+            if col in {"Flow ID", "Source IP", "Destination IP", "Timestamp", "Label"}:
+                continue
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
+        df["_file"] = file.name
+        parts.append(df.drop(columns=["Flow ID"], errors="ignore"))
+    frame = pd.concat(parts, ignore_index=True, sort=False)
+    del parts
+    target = _binary_labels(frame["Label"])
+    keep = target >= 0
+    if (~keep).any():
+        warnings.warn(f"Dropping {(~keep).sum()} rows with missing labels.")
+    frame = frame.loc[keep].reset_index(drop=True)
+    frame["_target"] = target[keep]
+    frame["_attack_type"] = frame["Label"].map(normalize_attack_name)
+    ts = repair_cic_timestamps(frame["Timestamp"])
+    bad = ts.isna().to_numpy()
+    if bad.any():
+        warnings.warn(f"Dropping {bad.sum()} rows with unparseable timestamps.")
+        frame, ts = frame.loc[~bad].reset_index(drop=True), ts.loc[~bad].reset_index(drop=True)
+    frame["_datetime"] = ts.to_numpy()
+    frame["_time_seconds"] = ((ts - pd.Timestamp("1970-01-01")).dt.total_seconds()).astype(np.int64).to_numpy()  # unit-safe
+    frame["_day"] = ts.dt.dayofweek.map(DAY_NAMES).fillna("Other").to_numpy()
+    frame["_time_source"] = "Timestamp (12h clock repaired)"
+    return frame.sort_values("_time_seconds", kind="stable").reset_index(drop=True)
+
+
+def add_windows(frame: pd.DataFrame, window_seconds: int) -> pd.DataFrame:
+    frame["_window"] = (frame["_time_seconds"] // window_seconds).astype(np.int64)
+    return frame
+
+
+def window_benign_cap(frame: pd.DataFrame, cap: int | None, seed: int = 17) -> pd.DataFrame:
+    """Topology-preserving reduction: keep every attack flow and every window.
+
+    Inside each window at most `cap` benign flows are kept (random), so benign
+    traffic is thinned but attack structure (scans, DDoS stars) is complete.
+    `cap=None` keeps everything.
+    """
+    if not cap:
+        return frame.reset_index(drop=True)
+    rng = np.random.default_rng(seed)
+    keys = rng.random(len(frame))
+    benign = frame["_target"].to_numpy() == 0
+    order = pd.DataFrame({"w": frame["_window"].to_numpy(), "k": keys})
+    rank = order.where(pd.Series(benign)).groupby("w")["k"].rank(method="first")
+    keep = (~benign) | (rank.to_numpy() <= cap)
+    return frame.loc[keep].sort_values("_time_seconds", kind="stable").reset_index(drop=True)
+
+
+def split_protocol_a(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Unseen attacks: Mon-Wed train, Thursday validation, Friday test."""
+    day = frame["_day"].to_numpy()
+    train = np.flatnonzero(np.isin(day, ["Monday", "Tuesday", "Wednesday"]))
+    val = np.flatnonzero(day == "Thursday")
+    test = np.flatnonzero(day == "Friday")
     return train, val, test
+
+
+def window_labels(frame: pd.DataFrame) -> pd.Series:
+    """Dominant attack type of each window ('Benign' when it has no attack flow)."""
+    attacks = frame.loc[frame["_target"] == 1, ["_window", "_attack_type"]]
+    dominant = attacks.groupby("_window")["_attack_type"].agg(lambda s: s.value_counts().index[0])
+    windows = pd.Series(np.unique(frame["_window"]))
+    return windows.map(dominant).fillna("Benign").set_axis(windows.to_numpy())
+
+
+def split_protocol_b(frame: pd.DataFrame, train_fraction: float = 0.6, validation_fraction: float = 0.2):
+    """Seen attacks: split the windows of each dominant type chronologically 60/20/20."""
+    labels = window_labels(frame)
+    assignment: dict[int, str] = {}
+    for kind, windows in labels.groupby(labels):
+        ordered = np.sort(windows.index.to_numpy())
+        n = len(ordered)
+        if n < 3:  # too rare to split: keep in train so the type is at least learned
+            for w in ordered:
+                assignment[int(w)] = "train"
+            continue
+        n_train = max(1, int(round(n * train_fraction)))
+        n_val = max(1, int(round(n * validation_fraction)))
+        n_train = min(n_train, n - 2)
+        n_val = min(n_val, n - n_train - 1)
+        for i, w in enumerate(ordered):
+            assignment[int(w)] = "train" if i < n_train else ("val" if i < n_train + n_val else "test")
+    part = frame["_window"].map(assignment).to_numpy()
+    return (np.flatnonzero(part == "train"), np.flatnonzero(part == "val"), np.flatnonzero(part == "test"))
+
+
+def attack_counts(frame: pd.DataFrame, indices: np.ndarray) -> dict[str, int]:
+    counts = frame.iloc[indices]["_attack_type"].value_counts()
+    return {str(k): int(v) for k, v in counts.items()}

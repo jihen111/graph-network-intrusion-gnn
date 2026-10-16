@@ -1,7 +1,5 @@
 # Dataset files
 
-The raw archives are intentionally excluded from Git. Run `python scripts/download_data.py` to obtain the public mirror of CIC-IDS2017 `GeneratedLabelledFlows.zip` into `data/raw/cic-generated-labelled-flows/`.
+Raw data is not committed. `python scripts/download_data.py` downloads CIC-IDS2017 `GeneratedLabelledFlows.zip` (about 270 MB) from the public Hugging Face mirror [bencorn/CICIDS2017](https://huggingface.co/datasets/bencorn/CICIDS2017) into `data/raw/cic-generated-labelled-flows/`. These CSVs keep source/destination IPs, ports and timestamps, which graph construction needs. Dataset description: [CIC-IDS2017](https://www.unb.ca/cic/datasets/ids-2017.html).
 
-The source project and field description are on the [official CIC-IDS2017 dataset page](https://www.unb.ca/cic/datasets/ids-2017.html). The public archive mirror used by this project is [bencorn/CICIDS2017 on Hugging Face](https://huggingface.co/datasets/bencorn/CICIDS2017), file `csvs/GeneratedLabelledFlows.zip`. It contains the labelled flow CSVs, not the multi-gigabyte PCAP files.
-
-The preferred NF-UNSW-NB15-v2 parquet was also tested during project setup. The downloaded feature-only table does not include endpoints or timestamps, so it cannot support this repository's host-graph and chronological-split requirements. The rationale is recorded in `DECISIONS.md`.
+`scripts/make_smoke_data.py` writes a tiny synthetic dataset to `data/smoke/` for testing that the code runs. Never report metrics from it.

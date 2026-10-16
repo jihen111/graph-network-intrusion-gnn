@@ -1,6 +1,11 @@
-"""Run the end-to-end CPU experiments and save real metrics and figures."""
+"""End-to-end experiments on CIC-IDS2017: two protocols, three models, studies, figures.
+
+Every number written to results/ comes from this script. Thresholds are chosen
+on validation data only; test labels are used once, for the final metrics.
+"""
 from __future__ import annotations
 
+import gc
 import json
 import time
 from pathlib import Path
@@ -11,267 +16,406 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd
-import torch
 import yaml
 
-from src.build_graph import FlowGraph, build_graph_windows
-from src.data import load_flows, temporal_window_indices
-from src.metrics import classification_metrics
-from src.models.autoencoder import fit_benign_autoencoder, reconstruction_scores, threshold_by_validation_f1
+from src.build_graph import build_graph_windows, flow_order
+from src.data import (add_windows, attack_counts, load_cic, split_protocol_a, split_protocol_b,
+                      window_benign_cap)
+from src.metrics import classification_metrics, evaluate_scores, threshold_max_f1
+from src.models.autoencoder import fit_benign_autoencoder, reconstruction_scores
 from src.models.baseline import make_baseline
 from src.models.gnn import fit_supervised, predict_supervised
 from src.preprocess import FeaturePreprocessor
 
+# Validated categorical palette (dataviz reference palette, light mode)
+C_RF, C_GNN, C_AE = "#2a78d6", "#eb6834", "#1baf7a"
+C_BENIGN, C_ATTACK, C_GRID, C_TEXT = "#2a78d6", "#e34948", "#dce1e8", "#52514e"
+MODELS = ["Random Forest (flow-only)", "E-GraphSAGE", "Graph Autoencoder (benign-only)"]
 
-def _write_json(path: Path, obj) -> None:
-    def safe(value):
-        if isinstance(value, dict):
-            return {str(k): safe(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [safe(v) for v in value]
-        if isinstance(value, (np.integer,)): return int(value)
-        if isinstance(value, (np.floating, float)):
-            return float(value) if np.isfinite(value) else None
-        if isinstance(value, np.ndarray): return safe(value.tolist())
-        return value
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def write_json(path: Path, obj) -> None:
+    def safe(v):
+        if isinstance(v, dict):
+            return {str(k): safe(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [safe(x) for x in v]
+        if isinstance(v, np.integer):
+            return int(v)
+        if isinstance(v, (np.floating, float)):
+            return float(v) if np.isfinite(v) else None
+        if isinstance(v, np.ndarray):
+            return safe(v.tolist())
+        return v
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(safe(obj), indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(safe(obj), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def _labels(graphs: list[FlowGraph]) -> np.ndarray:
-    return np.concatenate([g.y.numpy() for g in graphs]) if graphs else np.array([], dtype=int)
+def style(ax):
+    ax.grid(color=C_GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(C_GRID)
+    ax.tick_params(colors=C_TEXT)
 
 
-def _graph_sets(frame: pd.DataFrame, features: np.ndarray, indices: np.ndarray, window_size: int, window_seconds: int):
-    subset = frame.iloc[indices].reset_index(drop=True)
-    return build_graph_windows(subset, features[indices], window_size, window_seconds)
-
-
-def _train_endpoints(frame, train_idx, val_idx, test_idx, sample, seed, window_size, window_seconds):
-    # Fitting transforms on train only prevents validation/test statistics leaking into features.
-    prep = FeaturePreprocessor(engineered=True).fit(frame.iloc[train_idx])
+# ---------------------------------------------------------------- preparation
+def prepare(frame, splits, engineered=True):
+    """Fit preprocessing on train only, then build one graph per window for each split."""
+    train_idx = splits[0]
+    prep = FeaturePreprocessor(engineered=engineered).fit(frame.iloc[train_idx])
     X = prep.transform(frame)
-    return prep, X, (
-        _graph_sets(frame, X, train_idx, window_size, window_seconds),
-        _graph_sets(frame, X, val_idx, window_size, window_seconds),
-        _graph_sets(frame, X, test_idx, window_size, window_seconds),
-    )
+    graphs, order = {}, {}
+    for name, idx in zip(("train", "val", "test"), splits):
+        sub = frame.iloc[idx].reset_index(drop=True)
+        graphs[name] = build_graph_windows(sub, X[idx])
+        order[name] = idx[flow_order(graphs[name])]  # frame positions in prediction order
+        del sub
+    return X, graphs, order, prep.output_names
 
 
-def _attack_types(frame: pd.DataFrame, indices: np.ndarray) -> np.ndarray:
-    return frame.iloc[indices]["_attack_type"].astype(str).to_numpy()
+def labels_of(frame, order):
+    return frame["_target"].to_numpy()[order], frame["_attack_type"].to_numpy()[order]
 
 
-def _safe_positive_probability(model, X: np.ndarray) -> np.ndarray:
-    if 1 not in model.classes_:
-        return np.zeros(len(X), dtype=float)
-    return model.predict_proba(X)[:, list(model.classes_).index(1)]
+def summarize(records: list[dict], point: str) -> dict:
+    keys = ["precision", "recall", "f1", "false_positive_rate", "pr_auc"]
+    return {k: {"mean": float(np.mean([r[point][k] for r in records])),
+                "std": float(np.std([r[point][k] for r in records]))} for k in keys}
 
 
-def _summarize(records: list[dict]) -> dict:
-    numeric = [k for k, v in records[0].items() if isinstance(v, (int, float, np.number)) and k != "seed"] if records else []
-    return {key: {"mean": float(np.nanmean([r[key] for r in records])), "std": float(np.nanstd([r[key] for r in records], ddof=0))} for key in numeric}
+def per_attack_mean(records: list[dict], point: str) -> dict:
+    names = records[0][point]["detection_rate_per_attack"].keys()
+    return {n: {"mean": float(np.mean([r[point]["detection_rate_per_attack"][n]["detection_rate"] for r in records])),
+                "support": records[0][point]["detection_rate_per_attack"][n]["support"]} for n in names}
 
 
-def _flow_graph(frame: pd.DataFrame, labels: np.ndarray, selector: np.ndarray | None = None) -> nx.DiGraph:
-    src_col, dst_col = _ip_columns_local(frame)
-    g = nx.DiGraph()
-    indices = np.flatnonzero(selector) if selector is not None else np.arange(len(frame))
-    for i in indices:
-        g.add_edge(str(frame.iloc[i][src_col]), str(frame.iloc[i][dst_col]))
-    return g
+# ---------------------------------------------------------------- one protocol
+def run_protocol(name, frame, splits, cfg, seeds, keep_scores=False):
+    m, e = cfg["model"], cfg["experiments"]
+    t0 = time.time()
+    X, graphs, order, feat_names = prepare(frame, splits)
+    y_tr, _ = labels_of(frame, order["train"])
+    y_va, a_va = labels_of(frame, order["val"])
+    y_te, a_te = labels_of(frame, order["test"])
+    log(f"{name}: flows train/val/test = {len(y_tr):,}/{len(y_va):,}/{len(y_te):,}; "
+        f"windows = {len(graphs['train'])}/{len(graphs['val'])}/{len(graphs['test'])}; features = {X.shape[1]}")
+    records = {k: [] for k in MODELS}
+    kept, timings = {}, {k: [] for k in MODELS}
+    for seed in seeds:
+        t = time.time()
+        rf = make_baseline(seed, int(e["rf_trees"]), float(e["rf_max_samples"]))
+        rf.fit(X[order["train"]], y_tr)
+        s_va, s_te = rf.predict_proba(X[order["val"]])[:, 1], rf.predict_proba(X[order["test"]])[:, 1]
+        records[MODELS[0]].append({"seed": seed, **evaluate_scores(y_va, s_va, y_te, s_te, a_te)})
+        timings[MODELS[0]].append(time.time() - t)
+        if keep_scores and seed == seeds[0]:
+            kept[MODELS[0]] = s_te
+        log(f"{name} seed {seed}: RF done ({time.time() - t:.0f}s)")
+
+        t = time.time()
+        gnn = fit_supervised(graphs["train"], X.shape[1], seed, int(m["epochs"]), float(m["learning_rate"]),
+                             float(m["weight_decay"]), int(m["hidden_channels"]),
+                             validation_graphs=graphs["val"], patience=int(m["early_stopping_patience"]))
+        s_va, s_te = predict_supervised(gnn, graphs["val"]), predict_supervised(gnn, graphs["test"])
+        records[MODELS[1]].append({"seed": seed, "epochs": gnn.epochs_trained, **evaluate_scores(y_va, s_va, y_te, s_te, a_te)})
+        timings[MODELS[1]].append(time.time() - t)
+        if keep_scores and seed == seeds[0]:
+            kept[MODELS[1]] = s_te
+            kept["gnn_threshold"] = threshold_max_f1(y_va, s_va)
+        log(f"{name} seed {seed}: E-GraphSAGE done ({time.time() - t:.0f}s, {gnn.epochs_trained} epochs)")
+
+        t = time.time()
+        ae = fit_benign_autoencoder(graphs["train"], X.shape[1], seed, int(m["autoencoder_epochs"]),
+                                    float(m["learning_rate"]), float(m["weight_decay"]), int(m["hidden_channels"]),
+                                    validation_graphs=graphs["val"], patience=int(m["early_stopping_patience"]))
+        s_va, s_te = reconstruction_scores(ae, graphs["val"]), reconstruction_scores(ae, graphs["test"])
+        ev = evaluate_scores(y_va, s_va, y_te, s_te, a_te)
+        ev.pop("fixed_0.5")  # reconstruction errors are not probabilities
+        records[MODELS[2]].append({"seed": seed, "epochs": ae.epochs_trained, **ev})
+        timings[MODELS[2]].append(time.time() - t)
+        if keep_scores and seed == seeds[0]:
+            kept[MODELS[2]] = s_te
+        log(f"{name} seed {seed}: autoencoder done ({time.time() - t:.0f}s, {ae.epochs_trained} epochs)")
+    result = {
+        "splits": {
+            part: {"flows": int(len(idx)), "attacks": int(frame["_target"].to_numpy()[idx].sum()),
+                   "windows": int(len(graphs[part])), "attack_types": attack_counts(frame, idx)}
+            for part, idx in zip(("train", "val", "test"), splits)},
+        "features": int(X.shape[1]),
+        "per_seed": records,
+        "summary": {k: {p: summarize(v, p) for p in v[0] if p not in {"seed", "epochs"}} for k, v in records.items()},
+        "detection_rate_per_attack": {k: per_attack_mean(v, "val_f1_threshold") for k, v in records.items()},
+        "seconds_per_seed": {k: float(np.mean(v)) for k, v in timings.items()},
+        "runtime_seconds": float(time.time() - t0),
+    }
+    extra = {"graphs": graphs, "order": order, "X": X, "scores": kept, "y_test": y_te} if keep_scores else None
+    return result, extra
 
 
-def _ip_columns_local(frame: pd.DataFrame) -> tuple[str, str]:
-    from src.data import find_column
-    return find_column(frame, ("Source IP", "IPV4_SRC_ADDR", "src_ip", "source_ip")), find_column(frame, ("Destination IP", "IPV4_DST_ADDR", "dst_ip", "destination_ip"))
-
-
-def _graph_statistics(graphs: list[FlowGraph]) -> dict:
+# ---------------------------------------------------------------- studies
+def label_efficiency(frame, graphs, order, X, cfg, seeds):
+    m = cfg["model"]
+    y_va, _ = labels_of(frame, order["val"])
+    y_te, a_te = labels_of(frame, order["test"])
     rows = []
-    degree_values = {"Benign": [], "Attack": []}
-    fanouts = {"Benign": [], "Attack": []}
-    for graph in graphs:
-        for label, name in ((0, "Benign"), (1, "Attack")):
-            ids = np.flatnonzero(graph.y.numpy() == label)
-            g = nx.DiGraph()
-            g.add_edges_from((graph.src_hosts[i], graph.dst_hosts[i]) for i in ids)
-            if len(g) == 0:
+    for fraction in [float(f) for f in cfg["experiments"]["label_fractions"]]:
+        for seed in seeds:
+            model = fit_supervised(graphs["train"], X.shape[1], seed, int(m["epochs"]), float(m["learning_rate"]),
+                                   float(m["weight_decay"]), int(m["hidden_channels"]), label_fraction=fraction,
+                                   validation_graphs=graphs["val"], patience=int(m["early_stopping_patience"]))
+            s_va, s_te = predict_supervised(model, graphs["val"]), predict_supervised(model, graphs["test"])
+            ev = evaluate_scores(y_va, s_va, y_te, s_te, a_te)
+            rows.append({"label_fraction": fraction, "seed": seed, "f1": ev["val_f1_threshold"]["f1"],
+                         "pr_auc": ev["val_f1_threshold"]["pr_auc"], "recall_at_1pct_fpr": ev["val_fpr_1pct_threshold"]["recall"]})
+            log(f"label efficiency {fraction:g} seed {seed}: F1 {rows[-1]['f1']:.3f}")
+    return rows
+
+
+def ablation(frame, splits, cfg, seeds):
+    m = cfg["model"]
+    rows = []
+    for engineered in (True, False):
+        X, graphs, order, _ = prepare(frame, splits, engineered=engineered)
+        y_va, _ = labels_of(frame, order["val"])
+        y_te, a_te = labels_of(frame, order["test"])
+        for use_flow in (True, False):
+            if not engineered and not use_flow:
+                continue  # structure-only model does not use flow features at all
+            for seed in seeds:
+                model = fit_supervised(graphs["train"], X.shape[1], seed, int(m["epochs"]), float(m["learning_rate"]),
+                                       float(m["weight_decay"]), int(m["hidden_channels"]), use_flow_features=use_flow,
+                                       validation_graphs=graphs["val"], patience=int(m["early_stopping_patience"]))
+                s_va, s_te = predict_supervised(model, graphs["val"]), predict_supervised(model, graphs["test"])
+                ev = evaluate_scores(y_va, s_va, y_te, s_te, a_te)
+                label = ("engineered features" if engineered else "raw scaled features") if use_flow else "graph structure only"
+                rows.append({"variant": label, "seed": seed, "f1": ev["val_f1_threshold"]["f1"],
+                             "pr_auc": ev["val_f1_threshold"]["pr_auc"], "recall_at_1pct_fpr": ev["val_fpr_1pct_threshold"]["recall"]})
+                log(f"ablation {label} seed {seed}: F1 {rows[-1]['f1']:.3f}")
+        del X, graphs
+        gc.collect()
+    return rows
+
+
+# ---------------------------------------------------------------- figures
+def fig_timeline(frame, out):
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    fig, axes = plt.subplots(len(days), 1, figsize=(11, 10), sharex=True)
+    for ax, day in zip(axes, days):
+        d = frame[frame["_day"] == day]
+        hours = d["_datetime"].dt.hour + d["_datetime"].dt.minute / 60
+        bins = np.arange(8, 18.01, 5 / 60)
+        ax.hist(hours[d["_target"] == 0], bins=bins, color=C_BENIGN, alpha=0.55, label="Benign")
+        ax.hist(hours[d["_target"] == 1], bins=bins, color=C_ATTACK, alpha=0.9, label="Attack")
+        ax.set_yscale("log")
+        for kind in d.loc[d["_target"] == 1, "_attack_type"].value_counts().index[:4]:
+            h = hours[d["_attack_type"] == kind]
+            ax.text(h.median(), ax.get_ylim()[1] * 0.5 if ax.get_ylim()[1] > 1 else 1, kind, fontsize=8, color=C_TEXT, ha="center")
+        ax.set_ylabel(day, color=C_TEXT)
+        style(ax)
+    axes[0].legend(frameon=False, loc="upper right")
+    axes[-1].set_xlabel("Hour of day (local time, after 12-hour clock repair)", color=C_TEXT)
+    fig.suptitle("Flows per 5 minutes (log scale)", color=C_TEXT)
+    fig.tight_layout()
+    fig.savefig(out / "timeline.png", dpi=150)
+    plt.close(fig)
+
+
+def fig_models(results, out):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
+    for ax, (proto, title) in zip(axes, (("protocol_a", "Protocol A: unseen attacks"), ("protocol_b", "Protocol B: seen attacks"))):
+        s = results[proto]["summary"]
+        metrics = [("f1", "F1"), ("recall", "Recall"), ("precision", "Precision")]
+        x = np.arange(len(metrics))
+        for i, (model, color) in enumerate(zip(MODELS, (C_RF, C_GNN, C_AE))):
+            vals = [s[model]["val_f1_threshold"][k]["mean"] for k, _ in metrics]
+            errs = [s[model]["val_f1_threshold"][k]["std"] for k, _ in metrics]
+            ax.bar(x + (i - 1) * 0.27, vals, 0.25, yerr=errs, color=color, label=model, capsize=2, edgecolor="white", linewidth=1)
+        ax.set_xticks(x, [lab for _, lab in metrics])
+        ax.set_ylim(0, 1.05)
+        ax.set_title(title, color=C_TEXT)
+        style(ax)
+    axes[0].set_ylabel("Test score (threshold chosen on validation)", color=C_TEXT)
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, frameon=False, loc="lower center", ncol=3)
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.savefig(out / "model_comparison.png", dpi=150)
+    plt.close(fig)
+
+
+def fig_label_efficiency(rows, out):
+    df = pd.DataFrame(rows).groupby("label_fraction")[["f1", "recall_at_1pct_fpr"]].agg(["mean", "std"]).reset_index()
+    fig, ax = plt.subplots(figsize=(6.5, 4.3))
+    for col, color, lab in (("f1", C_GNN, "F1 (validation-tuned threshold)"), ("recall_at_1pct_fpr", C_RF, "Recall at 1 % FPR")):
+        ax.errorbar(df["label_fraction"] * 100, df[(col, "mean")], yerr=df[(col, "std")].fillna(0), marker="o",
+                    capsize=3, color=color, label=lab, linewidth=2)
+    ax.set(xscale="log", ylim=(0, 1.02))
+    ax.set_xticks([1, 5, 10, 25, 100], ["1", "5", "10", "25", "100"])
+    ax.set_xlabel("Training labels used (%)", color=C_TEXT)
+    ax.set_ylabel("Test score (E-GraphSAGE, protocol B)", color=C_TEXT)
+    ax.legend(frameon=False, loc="lower right")
+    style(ax)
+    fig.tight_layout()
+    fig.savefig(out / "label_efficiency.png", dpi=150)
+    plt.close(fig)
+
+
+def graph_statistics(graphs, attack_names):
+    """Per source host and window: distinct destinations and distinct destination ports."""
+    rows = []
+    for g in graphs:
+        y = g.y.numpy()
+        src = np.array(g.src_hosts)
+        dst = np.array(g.dst_hosts)
+        for label in (0, 1):
+            ids = np.flatnonzero(y == label)
+            if not len(ids):
                 continue
-            degree_values[name].extend(dict(g.degree()).values())
-            source_fanouts = [degree for _, degree in g.out_degree() if degree > 0]
-            fanouts[name].extend(source_fanouts)
-            rows.append({
-                "class": name,
-                "window_id": int(graph.window_id),
-                "flows": int(len(ids)),
-                "nodes": int(g.number_of_nodes()),
-                "edges": int(g.number_of_edges()),
-                "components": int(nx.number_weakly_connected_components(g)),
-                "density": float(nx.density(g)),
-                "mean_unique_destinations_per_source": float(np.mean(source_fanouts)),
-            })
-    summary = {}
-    for name in ("Benign", "Attack"):
-        selected = [r for r in rows if r["class"] == name]
-        summary[name] = {
-            "windows": len(selected),
-            "mean_flows": float(np.mean([r["flows"] for r in selected])) if selected else 0.0,
-            "mean_nodes": float(np.mean([r["nodes"] for r in selected])) if selected else 0.0,
-            "mean_edges": float(np.mean([r["edges"] for r in selected])) if selected else 0.0,
-            "mean_components": float(np.mean([r["components"] for r in selected])) if selected else 0.0,
-            "mean_density": float(np.mean([r["density"] for r in selected])) if selected else 0.0,
-            "mean_fanout": float(np.mean(fanouts[name])) if fanouts[name] else 0.0,
-        }
-    return {"per_window": rows, "summary": summary, "degree_values": degree_values, "fanout_values": fanouts}
+            df = pd.DataFrame({"src": src[ids], "dst": dst[ids], "port": g.dst_port[ids]})
+            agg = df.groupby("src").agg(destinations=("dst", "nunique"), ports=("port", "nunique"), flows=("dst", "size"))
+            agg["class"] = "Attack" if label else "Benign"
+            agg["window"] = g.window_id
+            rows.append(agg.reset_index())
+    stats = pd.concat(rows, ignore_index=True)
+    summary = stats.groupby("class")[["destinations", "ports", "flows"]].agg(["mean", "median", "max"])
+    return stats, {c: {f"{a}_{b}": float(summary.loc[c, (a, b)]) for a, b in summary.columns} for c in summary.index}
 
 
-def _save_graph_figures(graph_data: dict, test_graphs: list[FlowGraph], test_prob: np.ndarray, out: Path) -> None:
-    out.mkdir(parents=True, exist_ok=True)
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    colors = {"Benign": "#277da1", "Attack": "#f94144"}
-    for name in ("Benign", "Attack"):
-        values = graph_data["degree_values"][name]
-        if values:
-            axes[0].hist(values, bins=min(25, max(5, len(set(values)))), density=True, alpha=0.65, label=name, color=colors[name])
-        fanout = graph_data["fanout_values"][name]
-        if fanout:
-            axes[1].hist(fanout, bins=min(25, max(5, len(set(fanout)))), density=True, alpha=0.65, label=name, color=colors[name])
-    axes[0].set(title="Degree distribution", xlabel="Degree", ylabel="Density")
-    axes[1].set(title="Unique destinations per source", xlabel="Out-degree / fan-out", ylabel="Density")
-    for ax in axes: ax.legend(frameon=False); ax.grid(alpha=0.2)
-    fig.tight_layout(); fig.savefig(out / "graph_comparison.png", dpi=160); plt.close(fig)
+def fig_graph_comparison(stats, out):
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    for ax, col, title in ((axes[0], "destinations", "Distinct destination hosts per source"),
+                           (axes[1], "ports", "Distinct destination ports per source")):
+        data = [stats.loc[stats["class"] == c, col].to_numpy() for c in ("Benign", "Attack")]
+        bins = np.logspace(0, np.log10(max(2, max(d.max() for d in data if len(d)))) + 0.05, 30)
+        for d, c, color in zip(data, ("Benign", "Attack"), (C_BENIGN, C_ATTACK)):
+            ax.hist(d, bins=bins, density=True, alpha=0.55 if c == "Benign" else 0.75, color=color, label=c)
+        ax.set(xscale="log", yscale="log")
+        ax.set_title(title, color=C_TEXT)
+        ax.set_xlabel("Count per source host and 5-minute window", color=C_TEXT)
+        style(ax)
+    axes[0].set_ylabel("Density", color=C_TEXT)
+    axes[0].legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out / "graph_comparison.png", dpi=150)
+    plt.close(fig)
 
-    remaining = np.asarray(test_prob, dtype=float).copy()
-    candidates = []
-    cursor = 0
-    for g in test_graphs:
-        scores = remaining[cursor:cursor + len(g.y)]
-        cursor += len(g.y)
-        flagged = np.flatnonzero(scores >= 0.5)
-        candidates.append((len(flagged), g, flagged, scores))
-    count, graph, flagged, scores = max(candidates, key=lambda x: x[0]) if candidates else (0, None, [], np.array([]))
-    fig, ax = plt.subplots(figsize=(8, 6))
-    if graph is None or count == 0:
-        ax.text(0.5, 0.5, "No test-window edge crossed the 0.5 decision threshold.", ha="center", va="center", wrap=True)
+
+def fig_attack_subgraph(frame, graphs, order, scores, threshold, out):
+    """Pick the test window with the most flagged PortScan (else any attack) flows and draw it."""
+    attack = frame["_attack_type"].to_numpy()[order]
+    best, cursor = None, 0
+    for g in graphs:
+        n = len(g.y)
+        s, a = scores[cursor:cursor + n], attack[cursor:cursor + n]
+        cursor += n
+        flagged = s >= threshold
+        for kind_rank, kind in enumerate(("PortScan", "DDoS", "DoS Hulk", "Bot")):
+            hits = int(((a == kind) & flagged).sum())
+            if hits:
+                key = (-kind_rank, hits)
+                if best is None or key > best[0]:
+                    best = (key, g, s, a, kind)
+                break
+    fig, ax = plt.subplots(figsize=(9, 6.5))
+    if best is None:
+        ax.text(0.5, 0.5, "No test window contains a flagged attack flow.", ha="center")
         ax.set_axis_off()
+        info = {}
     else:
+        _, g, s, a, kind = best
+        flagged = np.flatnonzero(s >= threshold)
         G = nx.DiGraph()
         for i in flagged:
-            G.add_edge(graph.src_hosts[i], graph.dst_hosts[i], score=float(scores[i]))
-        if G.number_of_nodes() > 60:
-            keep = sorted(G.degree, key=lambda x: x[1], reverse=True)[:60]
-            G = G.subgraph([n for n, _ in keep]).copy()
-        pos = nx.spring_layout(G, seed=11, k=0.6)
-        nx.draw_networkx(G, pos, ax=ax, node_size=320, font_size=7, arrows=True, width=0.8, node_color="#f4a261", edge_color="#555555")
-        ax.set_title(f"Model-flagged test subgraph — window {graph.window_id} ({G.number_of_edges()} displayed edges)")
-        ax.axis("off")
-    fig.tight_layout(); fig.savefig(out / "attack_subgraph.png", dpi=160); plt.close(fig)
+            u, v = g.src_hosts[i], g.dst_hosts[i]
+            G.add_edge(u, v, w=G.get_edge_data(u, v, {"w": 0})["w"] + 1)
+        true_attack_edges = {(g.src_hosts[i], g.dst_hosts[i]) for i in flagged if a[i] != "Benign"}
+        hubs = sorted(G.degree, key=lambda x: x[1], reverse=True)
+        keep = {n for n, _ in hubs[:80]}
+        H = G.subgraph(keep).copy()
+        pos = nx.spring_layout(H, seed=7, k=1.2 / np.sqrt(max(len(H), 1)))
+        hub = hubs[0][0]
+        colors = [C_ATTACK if n == hub else "#8a93a1" for n in H]
+        sizes = [80 + 18 * H.degree(n) if n == hub else 60 for n in H]
+        edge_colors = [C_ATTACK if (u, v) in true_attack_edges else C_BENIGN for u, v in H.edges]
+        nx.draw_networkx_edges(H, pos, ax=ax, edge_color=edge_colors, width=0.8, arrows=False, alpha=0.7)
+        nx.draw_networkx_nodes(H, pos, ax=ax, node_color=colors, node_size=sizes, edgecolors="white", linewidths=1)
+        nx.draw_networkx_labels(H, pos, labels={hub: hub}, font_size=9, ax=ax)
+        n_flows = len(flagged)
+        n_true = int((a[flagged] != "Benign").sum())
+        ax.set_title(f"Flagged flows in one test window ({kind}): {n_flows:,} flows, {n_true:,} truly malicious,\n"
+                     f"hub {hub} talks to {G.out_degree(hub) + G.in_degree(hub)} hosts (showing {len(H)} hosts)", color=C_TEXT, fontsize=10)
+        ax.set_axis_off()
+        info = {"window": int(g.window_id), "attack_type": kind, "flagged_flows": int(n_flows), "truly_malicious": n_true,
+                "hub": hub, "hub_peers": int(G.out_degree(hub) + G.in_degree(hub)), "hosts_in_flagged_graph": int(G.number_of_nodes())}
+    fig.tight_layout()
+    fig.savefig(out / "attack_subgraph.png", dpi=150)
+    plt.close(fig)
+    return info
 
 
-def _plot_label_efficiency(records: list[dict], out: Path) -> None:
-    frame = pd.DataFrame(records)
-    summary = frame.groupby("label_fraction")["f1"].agg(["mean", "std"]).reset_index()
-    summary["std"] = summary["std"].fillna(0)
-    fig, ax = plt.subplots(figsize=(6.5, 4.5))
-    # F1 is bounded; asymmetric clipped errors avoid implying impossible values.
-    lower = np.minimum(summary["std"].to_numpy(), summary["mean"].to_numpy())
-    upper = np.minimum(summary["std"].to_numpy(), 1.0 - summary["mean"].to_numpy())
-    ax.errorbar(summary["label_fraction"] * 100, summary["mean"], yerr=np.vstack([lower, upper]), marker="o", capsize=3, color="#277da1")
-    ax.set(xscale="log", xticks=[1, 5, 10, 25, 100], xticklabels=["1", "5", "10", "25", "100"], xlabel="Training labels used (%)", ylabel="Test F1", title="Label-efficiency study (mean ± std, 3 seeds)")
-    ax.set_ylim(0, 1)
-    ax.grid(alpha=0.25); fig.tight_layout(); fig.savefig(out, dpi=160); plt.close(fig)
-
-
-def run_experiments(config_path: str | Path, sample_override: int | None = None) -> dict:
+# ---------------------------------------------------------------- main
+def run_experiments(config_path: str | Path, quick: bool = False) -> dict:
     started = time.time()
     cfg = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
-    data_cfg, split_cfg, model_cfg, exp_cfg = cfg["data"], cfg["split"], cfg["model"], cfg["experiments"]
-    sample = sample_override if sample_override is not None else data_cfg.get("sample")
-    out = Path(exp_cfg.get("output_dir", "results")); out.mkdir(parents=True, exist_ok=True)
-    print(f"Loading {data_cfg['path']} (sample={sample})", flush=True)
-    frame = load_flows(data_cfg["path"], sample=sample, seed=int(data_cfg.get("sample_seed", 17)))
-    window_size = int(data_cfg.get("window_size", 2000))
-    window_seconds = int(data_cfg.get("window_seconds", 3600))
-    train_idx, val_idx, test_idx = temporal_window_indices(frame, window_seconds, float(split_cfg["train_fraction"]), float(split_cfg["validation_fraction"]))
-    y_train = frame.iloc[train_idx]["_target"].to_numpy(dtype=int)
-    y_val = frame.iloc[val_idx]["_target"].to_numpy(dtype=int)
-    y_test = frame.iloc[test_idx]["_target"].to_numpy(dtype=int)
-    attack_test = _attack_types(frame, test_idx)
-    seeds = [int(s) for s in exp_cfg["seeds"]]
-    early_stopping_patience = int(model_cfg.get("early_stopping_patience", 2))
-    prep, X, (train_graphs, val_graphs, test_graphs) = _train_endpoints(frame, train_idx, val_idx, test_idx, sample, seeds[0], window_size, window_seconds)
-    print(f"Loaded {len(frame):,} flows; train/val/test={len(train_idx):,}/{len(val_idx):,}/{len(test_idx):,}; features={X.shape[1]}; windows={len(train_graphs)}/{len(val_graphs)}/{len(test_graphs)}", flush=True)
-    if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
-        print("Warning: a temporal split contains a single binary class; some metrics may be undefined.", flush=True)
+    d, e = cfg["data"], cfg["experiments"]
+    seeds = [int(s) for s in e["seeds"]][: (1 if quick else None)]
+    out = Path(e.get("output_dir", "results"))
+    out.mkdir(parents=True, exist_ok=True)
+    log(f"Loading {d['path']}")
+    full = load_cic(d["path"])
+    full = add_windows(full, int(d["window_seconds"]))
+    n_full, n_full_attack = len(full), int(full["_target"].sum())
+    full_attack_counts = full["_attack_type"].value_counts().to_dict()
+    fig_timeline(full, out)
+    schedule = (full[full["_target"] == 1].groupby(["_day", "_attack_type"])["_datetime"]
+                .agg(["min", "max", "size"]).reset_index())
+    schedule["min"], schedule["max"] = schedule["min"].dt.strftime("%H:%M"), schedule["max"].dt.strftime("%H:%M")
+    frame = window_benign_cap(full, d.get("benign_cap_per_window"), int(d.get("sample_seed", 17)))
+    del full
+    gc.collect()
+    if quick:
+        frame = window_benign_cap(frame, 300, 17)
+    log(f"Flows used: {len(frame):,} of {n_full:,} (all {n_full_attack:,} attack flows kept)")
 
-    main: dict[str, list[dict]] = {"Random Forest (flow-only)": [], "E-GraphSAGE": [], "Benign Graph Autoencoder": []}
-    test_prob_first_seed = None
-    for seed in seeds:
-        print(f"Main models, seed={seed}", flush=True)
-        baseline = make_baseline(seed, int(exp_cfg.get("max_trees", 120)))
-        baseline.fit(X[train_idx], y_train)
-        p_rf = _safe_positive_probability(baseline, X[test_idx])
-        main["Random Forest (flow-only)"].append({"seed": seed, **classification_metrics(y_test, p_rf, attack_test)})
+    results = {}
+    results["protocol_a"], _ = run_protocol("Protocol A", frame, split_protocol_a(frame), cfg, seeds)
+    gc.collect()
+    splits_b = split_protocol_b(frame, float(cfg["split"]["train_fraction"]), float(cfg["split"]["validation_fraction"]))
+    results["protocol_b"], extra = run_protocol("Protocol B", frame, splits_b, cfg, seeds, keep_scores=True)
+    fig_models(results, out)
 
-        gnn = fit_supervised(train_graphs, X.shape[1], X.shape[1], seed, int(model_cfg["epochs"]), float(model_cfg["learning_rate"]), float(model_cfg["weight_decay"]), int(model_cfg["hidden_channels"]), validation_graphs=val_graphs, patience=early_stopping_patience)
-        p_gnn = predict_supervised(gnn, test_graphs)
-        main["E-GraphSAGE"].append({"seed": seed, **classification_metrics(y_test, p_gnn, attack_test)})
-        if seed == seeds[0]: test_prob_first_seed = p_gnn
+    stats, graph_summary = graph_statistics(extra["graphs"]["test"], None)
+    fig_graph_comparison(stats, out)
+    subgraph = fig_attack_subgraph(frame, extra["graphs"]["test"], extra["order"]["test"],
+                                   extra["scores"]["E-GraphSAGE"], extra["scores"]["gnn_threshold"], out)
+    write_json(out / "graph_analysis.json", {"split": "protocol B test windows", "per_source_summary": graph_summary,
+                                             "attack_subgraph": subgraph})
 
-        ae = fit_benign_autoencoder(train_graphs, X.shape[1], X.shape[1], seed, int(model_cfg["autoencoder_epochs"]), float(model_cfg["learning_rate"]), float(model_cfg["weight_decay"]), int(model_cfg["hidden_channels"]), validation_graphs=val_graphs, patience=early_stopping_patience)
-        val_scores = reconstruction_scores(ae, val_graphs)
-        threshold = threshold_by_validation_f1(y_val, val_scores)
-        test_scores = reconstruction_scores(ae, test_graphs)
-        main["Benign Graph Autoencoder"].append({"seed": seed, **classification_metrics(y_test, test_scores, attack_test, threshold)})
+    le_rows = label_efficiency(frame, extra["graphs"], extra["order"], extra["X"], cfg, seeds)
+    write_json(out / "label_efficiency.json", le_rows)
+    fig_label_efficiency(le_rows, out)
+    del extra
+    gc.collect()
 
-    aggregate = {name: _summarize(records) for name, records in main.items()}
-    # Label-efficiency: only training labels are reduced; val/test are unchanged.
-    label_records = []
-    for fraction in [float(x) for x in exp_cfg["label_fractions"]]:
-        for seed in seeds:
-            print(f"Label-efficiency fraction={fraction:g}, seed={seed}", flush=True)
-            model = fit_supervised(train_graphs, X.shape[1], X.shape[1], seed, int(model_cfg["epochs"]), float(model_cfg["learning_rate"]), float(model_cfg["weight_decay"]), int(model_cfg["hidden_channels"]), label_fraction=fraction, validation_graphs=val_graphs, patience=early_stopping_patience)
-            probs = predict_supervised(model, test_graphs)
-            m = classification_metrics(y_test, probs, attack_test)
-            label_records.append({"label_fraction": fraction, "seed": seed, **m})
-    _write_json(out / "label_efficiency.json", label_records)
-    _plot_label_efficiency(label_records, out / "label_efficiency.png")
+    ab_rows = ablation(frame, splits_b, cfg, seeds) if e.get("run_ablation", True) else []
+    write_json(out / "ablation.json", ab_rows)
 
-    # Preprocessing and edge-feature ablation; every scaler is refit on train only.
-    ablation_records = []
-    if bool(exp_cfg.get("run_ablation", True)):
-        for engineered in (True, False):
-            ablation_prep = FeaturePreprocessor(engineered=engineered).fit(frame.iloc[train_idx])
-            Xa = ablation_prep.transform(frame)
-            tr_graphs = _graph_sets(frame, Xa, train_idx, window_size, window_seconds)
-            va_graphs = _graph_sets(frame, Xa, val_idx, window_size, window_seconds)
-            te_graphs = _graph_sets(frame, Xa, test_idx, window_size, window_seconds)
-            for include_edge in (True, False):
-                for seed in seeds:
-                    print(f"Ablation engineered={engineered}, edge_features={include_edge}, seed={seed}", flush=True)
-                    model = fit_supervised(tr_graphs, Xa.shape[1], Xa.shape[1], seed, int(model_cfg["epochs"]), float(model_cfg["learning_rate"]), float(model_cfg["weight_decay"]), int(model_cfg["hidden_channels"]), include_edge_features=include_edge, validation_graphs=va_graphs, patience=early_stopping_patience)
-                    probs = predict_supervised(model, te_graphs, include_edge_features=include_edge)
-                    record = {"features": "engineered" if engineered else "raw-scaled", "edge_features": include_edge, "seed": seed, **classification_metrics(y_test, probs, attack_test)}
-                    ablation_records.append(record)
-    _write_json(out / "ablation.json", ablation_records)
-
-    graph_data = _graph_statistics(test_graphs)
-    graph_json = {"per_window": graph_data["per_window"], "summary": graph_data["summary"], "split": "test only"}
-    _write_json(out / "graph_analysis.json", graph_json)
-    _save_graph_figures(graph_data, test_graphs, test_prob_first_seed if test_prob_first_seed is not None else np.zeros(len(y_test)), out)
-
-    result = {
-        "dataset": {"path": str(data_cfg["path"]), "rows_loaded": int(len(frame)), "sample_requested": sample, "sample_seed": int(data_cfg.get("sample_seed", 17)), "timestamp_source": str(frame["_time_source"].iloc[0]), "features_after_encoding": int(X.shape[1]), "raw_columns": [str(c) for c in frame.columns if not str(c).startswith("_")]},
-        "split": {"method": f"contiguous chronological split by whole {window_seconds}-second windows after timestamp sorting", "train_fraction": float(split_cfg["train_fraction"]), "validation_fraction": float(split_cfg["validation_fraction"]), "counts": {"train": len(train_idx), "validation": len(val_idx), "test": len(test_idx)}, "positive_counts": {"train": int(y_train.sum()), "validation": int(y_val.sum()), "test": int(y_test.sum())}},
-        "main_models_per_seed": main,
-        "main_models_mean_std": aggregate,
-        "label_efficiency_file": str(out / "label_efficiency.json"),
-        "ablation_file": str(out / "ablation.json"),
-        "graph_analysis_file": str(out / "graph_analysis.json"),
+    metrics = {
+        "dataset": {"source": "CIC-IDS2017 GeneratedLabelledFlows (TrafficLabelling CSVs)", "flows_total": n_full,
+                    "attack_flows_total": n_full_attack, "flows_used": int(len(frame)),
+                    "benign_cap_per_window": d.get("benign_cap_per_window"), "window_seconds": int(d["window_seconds"]),
+                    "attack_types_total": {str(k): int(v) for k, v in full_attack_counts.items()},
+                    "attack_schedule_after_repair": schedule.to_dict(orient="records")},
+        "seeds": seeds,
+        **results,
         "runtime_seconds": float(time.time() - started),
-        "device": "cpu",
+        "quick_mode": quick,
     }
-    _write_json(out / "metrics.json", result)
-    print(f"Saved real test metrics to {out / 'metrics.json'} in {result['runtime_seconds']:.1f}s", flush=True)
-    return result
+    write_json(out / "metrics.json", metrics)
+    log(f"Done in {metrics['runtime_seconds'] / 60:.1f} min; results in {out}/")
+    return metrics

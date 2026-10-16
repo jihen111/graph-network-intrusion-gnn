@@ -1,22 +1,22 @@
 data:
   path: data/raw/cic-generated-labelled-flows
-  sample: 40000
+  window_seconds: 300          # one graph per 5-minute window
+  benign_cap_per_window: 2000  # keep every attack flow; thin benign flows inside each window
   sample_seed: 17
-  window_size: 2000
-  window_seconds: 3600
-split:
+split:                         # protocol B: chronological split of each attack type's windows
   train_fraction: 0.60
   validation_fraction: 0.20
 model:
-  hidden_channels: 32
-  epochs: 8
-  autoencoder_epochs: 8
-  early_stopping_patience: 2
+  hidden_channels: 64
+  epochs: 20
+  autoencoder_epochs: 20
+  early_stopping_patience: 3
   learning_rate: 0.003
   weight_decay: 0.0001
 experiments:
   seeds: [11, 23, 37]
   label_fractions: [0.01, 0.05, 0.10, 0.25, 1.0]
   run_ablation: true
-  max_trees: 120
+  rf_trees: 100
+  rf_max_samples: 0.1
   output_dir: results

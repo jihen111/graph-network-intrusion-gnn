@@ -1,134 +1,145 @@
 """Small deterministic unit tests; synthetic rows are only test fixtures."""
 import unittest
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
 import torch
 
-from src.build_graph import build_graph_windows
-from src.data import _binary_labels, load_flows, temporal_window_indices
+from src.build_graph import N_STRUCT, build_graph_windows, flow_order
+from src.data import (_binary_labels, add_windows, normalize_attack_name, repair_cic_timestamps,
+                      split_protocol_a, split_protocol_b, window_benign_cap)
+from src.metrics import classification_metrics, threshold_at_fpr, threshold_max_f1
 from src.models.autoencoder import EdgeFeatureAutoencoder, _benign_only_graph, fit_benign_autoencoder
 from src.models.gnn import EdgeGraphSAGE, _labeled_mask, fit_supervised
 from src.preprocess import FeaturePreprocessor
 
 
-class PreprocessingTests(unittest.TestCase):
+def toy_frame():
+    return pd.DataFrame({
+        "Source IP": ["a", "b", "a", "c", "a", "a"],
+        "Destination IP": ["b", "a", "c", "a", "d", "e"],
+        "Destination Port": [80, 443, 22, 80, 21, 23],
+        "Source Port": [5000, 5001, 5002, 5003, 5004, 5005],
+        "_target": [0, 1, 0, 1, 1, 1],
+        "_window": [0, 0, 0, 0, 1, 1],
+    })
+
+
+class DataTests(unittest.TestCase):
     def test_missing_labels_are_not_mislabeled_as_attacks(self):
-        labels = pd.Series(["BENIGN", "DDoS", None, ""])
-        np.testing.assert_array_equal(_binary_labels(labels), np.array([0, 1, -1, -1]))
+        np.testing.assert_array_equal(_binary_labels(pd.Series(["BENIGN", "DDoS", None, ""])), np.array([0, 1, -1, -1]))
 
-    def test_csv_sampling_ignores_unlabelled_rows(self):
-        with TemporaryDirectory() as temp:
-            folder = Path(temp)
-            df = pd.DataFrame({
-                "Timestamp": ["2020-01-01 00:00:00"] * 12,
-                "Source IP": ["a"] * 12,
-                "Destination IP": ["b"] * 12,
-                "Label": ["BENIGN"] * 5 + ["DoS"] * 5 + [None, ""],
-                "Flow Duration": list(range(12)),
-            })
-            df.to_csv(folder / "flows.csv", index=False)
-            flows = load_flows(folder, sample=8, seed=3)
-            self.assertEqual(len(flows), 8)
-            self.assertEqual(flows["_target"].value_counts().to_dict(), {0: 4, 1: 4})
-            self.assertTrue(flows["Timestamp"].notna().all())
+    def test_twelve_hour_clock_is_repaired(self):
+        ts = repair_cic_timestamps(pd.Series(["7/7/2017 3:56", "7/7/2017 10:02", "3/7/2017 08:55:58"]))
+        self.assertEqual(ts.dt.hour.tolist(), [15, 10, 8])
+        self.assertEqual(ts.dt.dayofweek.tolist(), [4, 4, 0])  # Friday, Friday, Monday
 
+    def test_attack_names_are_normalized(self):
+        self.assertEqual(normalize_attack_name("Web Attack � Brute Force"), "Web Attack - Brute Force")
+        self.assertEqual(normalize_attack_name("BENIGN"), "Benign")
+
+    def test_benign_cap_keeps_every_attack_flow(self):
+        frame = pd.DataFrame({"_window": [0] * 10 + [1] * 10, "_target": [0] * 8 + [1] * 2 + [0] * 10,
+                              "_time_seconds": np.arange(20)})
+        capped = window_benign_cap(frame, 3, seed=1)
+        self.assertEqual(int(capped["_target"].sum()), 2)
+        self.assertEqual(capped.groupby("_window")["_target"].apply(lambda s: (s == 0).sum()).tolist(), [3, 3])
+
+    def test_protocol_a_uses_days(self):
+        frame = pd.DataFrame({"_day": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]})
+        tr, va, te = split_protocol_a(frame)
+        self.assertEqual((tr.tolist(), va.tolist(), te.tolist()), ([0, 1, 2], [3], [4]))
+
+    def test_protocol_b_puts_each_attack_type_in_every_split_without_sharing_windows(self):
+        rows = []
+        for w in range(20):
+            kind = "DoS" if w < 10 else "Benign"
+            rows += [{"_window": w, "_target": int(kind != "Benign"), "_attack_type": kind},
+                     {"_window": w, "_target": 0, "_attack_type": "Benign"}]
+        frame = pd.DataFrame(rows)
+        parts = split_protocol_b(frame)
+        windows = [set(frame.iloc[p]["_window"]) for p in parts]
+        self.assertFalse(windows[0] & windows[1] or windows[0] & windows[2] or windows[1] & windows[2])
+        for p in parts:
+            self.assertIn("DoS", set(frame.iloc[p]["_attack_type"]))
+        self.assertEqual(sum(map(len, parts)), len(frame))
+
+
+class PreprocessingTests(unittest.TestCase):
     def test_identifiers_labels_and_ports_are_not_raw_features(self):
         frame = pd.DataFrame({
-            "Source IP": ["10.0.0.1", "10.0.0.2"],
-            "Destination IP": ["10.0.0.2", "10.0.0.1"],
-            "Source Port": [80, 51000], "Destination Port": [443, 80],
-            "Timestamp": ["2020-01-01", "2020-01-02"],
-            "Label": ["BENIGN", "DoS"], "Protocol": [6, 6],
-            "Flow Bytes/s": [100.0, 1_000_000.0],
+            "Source IP": ["10.0.0.1", "10.0.0.2"], "Destination IP": ["10.0.0.2", "10.0.0.1"],
+            "Source Port": [80, 51000], "Destination Port": [443, 80], "Timestamp": ["x", "y"],
+            "Label": ["BENIGN", "DoS"], "Protocol": [6, 6], "Flow Bytes/s": [100.0, 1_000_000.0],
+            "_window": [0, 1], "_day": ["Monday", "Monday"],
         })
         prep = FeaturePreprocessor(engineered=True).fit(frame.iloc[:1])
         x = prep.transform(frame)
         names = prep.output_names
-        self.assertFalse(any("Source IP" in name or "Destination IP" in name for name in names))
-        self.assertFalse(any("Source Port" in name or "Destination Port" in name for name in names))
-        self.assertFalse(any(name in {"Label", "Timestamp"} for name in names))
-        self.assertTrue(any("port_bucket" in name for name in names))
-        self.assertEqual(x.shape[0], 2)
+        self.assertFalse(any("IP" in n or n in {"Source Port", "Destination Port", "Label", "Timestamp"} for n in names))
+        self.assertFalse(any(n.startswith("_") for n in names))
+        self.assertTrue(any("port_bucket" in n for n in names))
         self.assertTrue(np.isfinite(x).all())
-
-    def test_fit_must_precede_transform(self):
-        prep = FeaturePreprocessor()
-        with self.assertRaises(RuntimeError):
-            prep.transform(pd.DataFrame({"x": [1]}))
 
 
 class GraphTests(unittest.TestCase):
     def setUp(self):
-        self.frame = pd.DataFrame({
-            "Source IP": ["a", "b", "a", "c"],
-            "Destination IP": ["b", "a", "c", "a"],
-            "_target": [0, 1, 0, 1],
-        })
-        self.features = np.array([[1., 0.], [0., 1.], [1., 1.], [.5, .5]], dtype=np.float32)
+        self.frame = toy_frame()
+        self.features = np.arange(12, dtype=np.float32).reshape(6, 2) / 10
 
-    def test_windows_are_directed_flow_labels_with_bidirectional_message_edges(self):
-        graphs = build_graph_windows(self.frame, self.features, window_size=2, window_seconds=None)
+    def test_one_graph_per_window_with_structural_features(self):
+        graphs = build_graph_windows(self.frame, self.features)
         self.assertEqual(len(graphs), 2)
-        self.assertEqual(graphs[0].edge_index.shape, (2, 4))
-        self.assertEqual(graphs[0].edge_x.shape, (2, 2))
-        self.assertEqual(graphs[0].y.tolist(), [0, 1])
-        self.assertEqual(graphs[1].y.tolist(), [0, 1])
-        self.assertEqual(graphs[0].node_x.shape[1], 2)
+        g1 = graphs[1]  # host a contacts d and e on two ports: a small scan
+        self.assertEqual(g1.edge_index.shape, (2, 4))
+        self.assertEqual(g1.struct_x.shape[1], N_STRUCT)
+        self.assertEqual(g1.node_x.shape[1], N_STRUCT + 2)
+        a = sorted(set(g1.src_hosts) | set(g1.dst_hosts)).index("a")
+        self.assertAlmostEqual(float(g1.struct_x[a, 2]), float(np.log1p(2)), places=5)  # distinct destinations
+        self.assertAlmostEqual(float(g1.struct_x[a, 4]), float(np.log1p(2)), places=5)  # distinct dst ports
+        np.testing.assert_array_equal(flow_order(graphs), np.arange(6))
 
-    def test_timestamp_split_keeps_whole_hour_buckets_together(self):
-        base = (1_500_000_000 // 3600) * 3600
-        frame = pd.DataFrame({
-            "_time_source": ["Timestamp"] * 9,
-            "_time_seconds": [base, base + 10, base + 3600, base + 3610, base + 7200, base + 7210, base + 10800, base + 10810, base + 14400],
-        })
-        tr, va, te = temporal_window_indices(frame, window_seconds=3600, train_fraction=.6, validation_fraction=.2)
-        bucket_groups = [set(np.floor(frame.iloc[idx]["_time_seconds"] / 3600).astype(int)) for idx in (tr, va, te)]
-        self.assertFalse(bucket_groups[0] & bucket_groups[1])
-        self.assertFalse(bucket_groups[0] & bucket_groups[2])
-        self.assertFalse(bucket_groups[1] & bucket_groups[2])
-        self.assertEqual(sum(map(len, (tr, va, te))), len(frame))
-
-    def test_edge_models_return_one_prediction_or_reconstruction_per_flow(self):
-        graph = build_graph_windows(self.frame, self.features, window_size=4, window_seconds=None)[0]
-        gnn = EdgeGraphSAGE(input_dim=2, edge_dim=2, hidden=8).eval()
-        logits = gnn(graph)
-        self.assertEqual(tuple(logits.shape), (4, 2))
-        self.assertTrue(torch.isfinite(logits).all())
+    def test_models_return_one_output_per_flow_and_ae_ignores_target_features(self):
+        graph = build_graph_windows(self.frame, self.features)[0]
+        for use_flow in (True, False):
+            logits = EdgeGraphSAGE(flow_dim=2, hidden=8, use_flow_features=use_flow).eval()(graph)
+            self.assertEqual(tuple(logits.shape), (4, 2))
         ae = EdgeFeatureAutoencoder(edge_dim=2, hidden=8).eval()
         with torch.no_grad():
-            original = ae(graph)
+            before = ae(graph)
             graph.edge_x = torch.full_like(graph.edge_x, 99.0)
-            after_target_change = ae(graph)
-        self.assertEqual(tuple(original.shape), (4, 2))
-        self.assertTrue(torch.allclose(original, after_target_change))
+            after = ae(graph)
+        self.assertTrue(torch.allclose(before, after))
 
     def test_autoencoder_training_graph_contains_only_benign_edges(self):
-        graph = build_graph_windows(self.frame, self.features, window_size=4, window_seconds=None)[0]
-        benign_graph = _benign_only_graph(graph)
-        self.assertIsNotNone(benign_graph)
-        self.assertEqual(benign_graph.y.tolist(), [0, 0])
-        self.assertEqual(benign_graph.edge_index.shape[1], 4)
-        self.assertEqual(benign_graph.edge_x.shape[0], 2)
+        graph = build_graph_windows(self.frame, self.features)[0]
+        benign = _benign_only_graph(graph)
+        self.assertEqual(benign.y.tolist(), [0, 0])
+        self.assertEqual(benign.edge_index.shape[1], 4)
+        self.assertEqual(benign.struct_x.shape, graph.struct_x.shape)
 
     def test_label_budget_is_class_stratified(self):
         y = torch.tensor([0] * 10 + [1] * 4)
         mask = _labeled_mask(y, .5, np.random.default_rng(7))
-        self.assertEqual(int(mask.sum()), 7)
         self.assertEqual(torch.bincount(y[mask], minlength=2).tolist(), [5, 2])
 
-    def test_both_trainers_accept_validation_windows_and_return_best_models(self):
-        graph = build_graph_windows(self.frame, self.features, window_size=4, window_seconds=None)[0]
-        gnn = fit_supervised([graph], 2, 2, seed=11, epochs=3, hidden=8,
-                             validation_graphs=[graph], patience=1)
-        ae = fit_benign_autoencoder([graph], 2, 2, seed=11, epochs=3, hidden=8,
-                                    validation_graphs=[graph], patience=1)
-        self.assertGreaterEqual(gnn.epochs_trained, 1)
-        self.assertLessEqual(gnn.epochs_trained, 3)
-        self.assertGreaterEqual(ae.epochs_trained, 1)
-        self.assertLessEqual(ae.epochs_trained, 3)
+    def test_trainers_run_with_validation_and_early_stopping(self):
+        graphs = build_graph_windows(self.frame, self.features)
+        gnn = fit_supervised(graphs, 2, seed=11, epochs=3, hidden=8, validation_graphs=graphs, patience=1)
+        ae = fit_benign_autoencoder(graphs, 2, seed=11, epochs=3, hidden=8, validation_graphs=graphs, patience=1)
+        self.assertTrue(1 <= gnn.epochs_trained <= 3 and 1 <= ae.epochs_trained <= 3)
+
+
+class MetricTests(unittest.TestCase):
+    def test_thresholds_use_validation_only(self):
+        y = np.array([0, 0, 0, 0, 1, 1])
+        s = np.array([.1, .2, .3, .4, .35, .9])
+        self.assertLessEqual(threshold_max_f1(y, s), .35)
+        t = threshold_at_fpr(y, s, fpr=0.0)
+        self.assertGreater(t, .4)
+        m = classification_metrics(y, s, np.array(["Benign"] * 4 + ["DoS", "DoS"]), t)
+        self.assertEqual(m["false_positive_rate"], 0.0)
+        self.assertEqual(m["detection_rate_per_attack"]["DoS"]["detection_rate"], 0.5)
 
 
 if __name__ == "__main__":

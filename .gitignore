@@ -5,8 +5,6 @@ __pycache__/
 .ipynb_checkpoints/
 data/raw/*
 !data/raw/.gitkeep
+data/smoke/
 data/processed/
-results/*.csv
-results/*.png
-results/*.json
-!results/.gitkeep
+*.zip
