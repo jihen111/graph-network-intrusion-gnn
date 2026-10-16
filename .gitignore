@@ -8,3 +8,4 @@ data/raw/*
 data/smoke/
 data/processed/
 *.zip
+results/scores_*.npz

@@ -50,3 +50,8 @@
 * Everything runs on CPU; a GPU is used automatically when available (`RUN_ON_COLAB.ipynb`).
 * `python -m src.train --quick` runs one seed with a small benign cap, for smoke tests only.
 * `scripts/make_smoke_data.py` writes a tiny synthetic CIC-like dataset used only to test that the pipeline runs; no metric from it is ever reported.
+
+## Figures (after the full run)
+
+* `model_comparison.png` shows the operating point a security team would use (threshold set for 1 % false positives on validation), not F1: on Friday about 60 % of flows are attacks, which rewards a detector that raises many false alarms.
+* `attack_subgraph.png` shows the port scan only. The "most hosts involved" panel always found 2 hosts, because every external attack in CIC-IDS2017 crosses one NAT gateway; the code now draws that panel only when an attack involves at least 3 hosts. Both figures were regenerated from the saved results without retraining.

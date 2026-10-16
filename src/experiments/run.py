@@ -234,20 +234,23 @@ def fig_timeline(frame, out):
 
 
 def fig_models(results, out):
+    """Operational comparison: share of attacks caught when 1 % of validation benign flows raise an alert."""
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), sharey=True)
     for ax, (proto, title) in zip(axes, (("protocol_a", "Protocol A: unseen attacks"), ("protocol_b", "Protocol B: seen attacks"))):
         s = results[proto]["summary"]
-        metrics = [("f1", "F1"), ("recall", "Recall"), ("precision", "Precision")]
+        metrics = [("recall", "Attacks caught (recall)"), ("false_positive_rate", "False alarms (test FPR)")]
         x = np.arange(len(metrics))
         for i, (model, color) in enumerate(zip(MODELS, (C_RF, C_GNN, C_AE))):
-            vals = [s[model]["val_f1_threshold"][k]["mean"] for k, _ in metrics]
-            errs = [s[model]["val_f1_threshold"][k]["std"] for k, _ in metrics]
-            ax.bar(x + (i - 1) * 0.27, vals, 0.25, yerr=errs, color=color, label=model, capsize=2, edgecolor="white", linewidth=1)
+            vals = [s[model]["val_fpr_1pct_threshold"][k]["mean"] for k, _ in metrics]
+            errs = [s[model]["val_fpr_1pct_threshold"][k]["std"] for k, _ in metrics]
+            bars = ax.bar(x + (i - 1) * 0.27, vals, 0.25, yerr=errs, color=color, label=model, capsize=2, edgecolor="white", linewidth=1)
+            for bar, v in zip(bars, vals):
+                ax.text(bar.get_x() + bar.get_width() / 2, v + 0.03, f"{100 * v:.0f}%", ha="center", fontsize=8, color=C_TEXT)
         ax.set_xticks(x, [lab for _, lab in metrics])
-        ax.set_ylim(0, 1.05)
+        ax.set_ylim(0, 1.1)
         ax.set_title(title, color=C_TEXT)
         style(ax)
-    axes[0].set_ylabel("Test score (threshold chosen on validation)", color=C_TEXT)
+    axes[0].set_ylabel("Test share (threshold: 1 % FPR on validation)", color=C_TEXT)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, frameon=False, loc="lower center", ncol=3)
     fig.tight_layout(rect=(0, 0.08, 1, 1))
@@ -334,7 +337,10 @@ def fig_attack_subgraph(frame, graphs, order, scores, threshold, out):
         scan_hits = hit[a[hit] == "PortScan"]
         if len(scan_hits) and (scan is None or len(set(g.dst_port[scan_hits])) > scan[0]):
             scan = (len(set(g.dst_port[scan_hits])), g, s, a)
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6.2))
+    if multi and multi[0] < 3:
+        multi = None  # every attack here crosses one NAT gateway: a 2-node picture says nothing
+    fig, axes = plt.subplots(1, 2 if multi else 1, figsize=(13, 6.2) if multi else (7.5, 6.5))
+    axes = np.atleast_1d(axes)
     info = {}
     ax = axes[0]
     if multi:
@@ -361,8 +367,8 @@ def fig_attack_subgraph(frame, graphs, order, scores, threshold, out):
                      color=C_TEXT, fontsize=10)
         info["most_hosts"] = {"window": int(g.window_id), "attack_type": kind, "hosts": len(bad_nodes),
                               "flagged_flows": int(len(flagged)), "truly_malicious": n_true}
-    ax.set_axis_off()
-    ax = axes[1]
+        ax.set_axis_off()
+        ax = axes[1]
     if scan:
         _, g, s, a = scan
         hit = np.flatnonzero((s >= threshold) & (a == "PortScan"))

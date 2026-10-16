@@ -129,7 +129,7 @@ All numbers below are produced by `python -m src.train` and stored in `results/`
 * **Few labels are enough on seen attacks:** with {100 * lo:g} % of the training labels E-GraphSAGE reaches F1 {le_s.loc[lo, ('f1', 'mean')]:.3f}, against {le_s.loc[hi, ('f1', 'mean')]:.3f} with {100 * hi:g} %.
 * **Structure carries the signal:** a GNN that sees only graph structure (degrees, distinct peers and ports, no flow statistics) reaches PR-AUC {ab_s.loc['graph structure only', ('pr_auc', 'mean')]:.3f} on protocol B. In test windows an attacking source contacts on average {src['Attack']['ports_mean']:.1f} distinct destination ports, against {src['Benign']['ports_mean']:.1f} for a benign source{nat_txt}
 {ae_txt}
-![Model comparison](results/model_comparison.png)
+![Attacks caught at 1 % false positives](results/model_comparison.png)
 
 ## Data and evaluation protocols
 
@@ -191,10 +191,12 @@ Share of each attack type's test flows flagged, with the threshold set for 1 % v
 
 ![Graph comparison](results/graph_comparison.png)
 
-""" + (f"""The figure below shows flows flagged by E-GraphSAGE in two protocol B test windows. Left: **{sub['most_hosts']['attack_type']}**, the attack involving the most hosts ({sub['most_hosts']['hosts']} hosts; {sub['most_hosts']['truly_malicious']:,} of {sub['most_hosts']['flagged_flows']:,} flagged flows truly malicious). Right: a port scan from `{sub['port_scan']['source']}` to `{sub['port_scan']['target']}` on {sub['port_scan']['distinct_ports']:,} distinct ports within 5 minutes.
+""" + (f"""The figure below shows a port scan flagged by E-GraphSAGE in a protocol B test window: `{sub['port_scan']['source']}` probes `{sub['port_scan']['target']}` on {sub['port_scan']['distinct_ports']:,} distinct ports within 5 minutes ({sub['port_scan']['flagged_flows']:,} flagged flows). """
+        + (f"The largest multi-host attack in the test windows ({sub['most_hosts']['attack_type']}) involves {sub['most_hosts']['hosts']} hosts. " if sub.get("most_hosts") else "")
+        + """Every external attack in CIC-IDS2017 enters through one NAT gateway, so the structure is \"many ports\" rather than \"many hosts\".
 
-![Attack subgraphs](results/attack_subgraph.png)
-""" if sub.get("most_hosts") and sub.get("port_scan") else "") + f"""
+![Attack subgraph](results/attack_subgraph.png)
+""" if sub.get("port_scan") else "") + f"""
 ## From flows to provenance graphs and lateral movement
 
 This project works on network flows. Moving to system-log provenance graphs (processes, files, sockets as typed nodes; read/write/fork/connect as typed edges) calls for heterogeneous or temporal GNNs (R-GCN, TGN) instead of the homogeneous GraphSAGE used here. Lateral movement is a path across several hosts and windows, so per-edge detections must be joined: link anomalous edges that share a host and follow each other in time, then score the chain. Evaluating that needs path-level labels (for example LANL or DARPA OpTC) and splits by time and by host. Notebook 02 develops this.

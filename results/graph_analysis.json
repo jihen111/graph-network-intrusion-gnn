@@ -1,0 +1,36 @@
+{
+  "split": "protocol B test windows",
+  "per_source_summary": {
+    "Attack": {
+      "destinations_mean": 1.0,
+      "destinations_median": 1.0,
+      "destinations_max": 1.0,
+      "ports_mean": 54.482142857142854,
+      "ports_median": 1.0,
+      "ports_max": 1000.0,
+      "flows_mean": 536.625,
+      "flows_median": 5.0,
+      "flows_max": 9027.0
+    },
+    "Benign": {
+      "destinations_mean": 3.0043155422986607,
+      "destinations_median": 1.0,
+      "destinations_max": 201.0,
+      "ports_mean": 2.4270482959954305,
+      "ports_median": 1.0,
+      "ports_max": 784.0,
+      "flows_mean": 11.666053182712446,
+      "flows_median": 1.0,
+      "flows_max": 1307.0
+    }
+  },
+  "attack_subgraph": {
+    "port_scan": {
+      "window": 4998133,
+      "source": "172.16.0.1",
+      "target": "192.168.10.50",
+      "distinct_ports": 999,
+      "flagged_flows": 9027
+    }
+  }
+}
